@@ -66,6 +66,8 @@ run_all.py（计划任务统一入口，pythonw.exe 静默运行）
 | 位置 | 内容 |
 |------|------|
 | `logs\run_YYYY-MM-DD.log` | 调度总日志（每次运行三个子任务的结果汇总） |
+| `logs\health.json` | 运行健康：各任务连续失败计数、最近成功/失败时间与错误 |
+| `logs\fail_任务_时间.txt` | 失败任务当轮的完整输出（总日志只留尾部摘要） |
 | `workbuddy\signin.log` | WorkBuddy 详细结果（JSON 行） |
 | `trae\.trae_checkin_state.json` | Trae 当日状态（避免重复请求） |
 | `qoder\checkin.log` | Qoder 详细结果（JSON 行） |
@@ -75,6 +77,20 @@ run_all.py（计划任务统一入口，pythonw.exe 静默运行）
 ```powershell
 Get-Content logs\run_$(Get-Date -Format yyyy-MM-dd).log
 ```
+
+## 失败自动处理
+
+每个子任务的结果被归入三态，调度器据此决定后续动作：
+
+| 状态 | 含义 | 处理方式 |
+|------|------|---------|
+| OK | 成功 / 已签 / 设计内跳过（未安装、活动未开放） | 正常退出 |
+| RETRY | 瞬时失败（网络、超时、服务端 5xx、9074 限流） | 当前轮不重试，下一个触发点自动补签（每天 6+ 次机会，已签幂等跳过） |
+| NEEDS_HUMAN | 凭据/会话失效（重新登录才能解决） | 重试无意义，落盘完整输出等待人工处理 |
+
+- 连续失败计数记在 `logs\health.json`（`consecutive_failures`），成功一次即清零。
+- 任何失败任务当轮的完整输出（不止日志摘要）写入 `logs\fail_<任务>_<时间>.txt`，用于追溯根因。
+- `python check.py` 的"运行健康"一节汇总显示三件套健康状态：NEEDS_HUMAN 或连续失败 ≥5 次会标红，并给出单任务排查命令。
 
 ## 常见问题
 
@@ -90,8 +106,9 @@ refreshToken 也失效，打开一次 Qoder CN 桌面端重新登录即可（凭
 登录会话失效，打开一次 WorkBuddy 桌面端即恢复。
 
 **Q: 某天断签了？**
-检查 `logs\` 当天日志。关机一整天的情况，开机触发（AutoCheckinBoot）会补签。
-注意各平台的连签奖励规则（部分平台允许补签）。
+检查 `logs\` 当天日志；连续失败看 `logs\health.json`，失败根因看 `logs\fail_*.txt`
+完整输出，或直接跑 `python check.py` 看运行健康汇总。关机一整天的情况，开机触发
+（AutoCheckinBoot）会补签。注意各平台的连签奖励规则（部分平台允许补签）。
 
 **Q: 怎么确认签到成功？**
 看 `logs\run_*.log` 的"本轮结果"，或打开各软件查看积分/连签天数。
@@ -102,6 +119,16 @@ refreshToken 也失效，打开一次 Qoder CN 桌面端重新登录即可（凭
   无需重装 `install.ps1`。
 - ZIP 方式：重新下载解压，覆盖到原目录。
 - 上游 `signin.py` / `trae_checkin.py` 发布新版时，可直接替换对应子目录文件。
+
+## 开发与测试
+
+```powershell
+python -m unittest tests.test_core    # 零依赖，45 项：退出码契约/轮签/失败分类/健康计数/AES 向量
+```
+
+子脚本退出码契约（调度器失败分类的依据）：`run_all.py` 0 全部成功；1 存在失败项。
+`trae_checkin.py` 0 成功/已签/软限流/未开放，1 硬失败或鉴权失败；`qoder_checkin.py`
+0 成功/已签/未开放，2 凭据缺失或解密失败，3 token 失效无法续期，4 签到请求失败。
 
 ## 卸载
 
