@@ -94,9 +94,15 @@ Get-Content logs\run_$(Get-Date -Format yyyy-MM-dd).log
 
 | 状态 | 含义 | 处理方式 |
 |------|------|---------|
-| OK | 成功 / 已签 / 设计内跳过（未安装、活动未开放） | 正常退出 |
+| OK | 成功 / 已签 / 设计内跳过（未安装、未登录） | 正常退出 |
 | RETRY | 瞬时失败（网络、超时、服务端 5xx、9074 限流） | 当前轮不重试，下一个触发点自动补签（每天 6+ 次机会，已签幂等跳过） |
-| NEEDS_HUMAN | 凭据/会话失效（重新登录才能解决） | 重试无意义，落盘完整输出等待人工处理 |
+| NEEDS_HUMAN | 凭据/会话失效（重新登录才能解决）；或 Qoder 返回非可领状态（DISABLED/未知，`NOT_CLAIMED`） | 重试无意义，落盘完整输出等待人工处理 |
+
+> **Qoder fail-close 说明**：Qoder 签到只对 `CLAIMED*`/`CLAIMABLE` 判成功，其余一切状态
+> （含 `DISABLED`、`ENDED`、未知）一律按失败上报（`NOT_CLAIMED`→NEEDS_HUMAN），绝不静默
+> 判绿。因为本任务目标是"真的领到 100 Credits"，"没领到"必须暴露。若你看到 Qoder 持续
+> NEEDS_HUMAN 且状态为 DISABLED，但桌面端 GUI 显示活动可领，说明 status 接口语义/账号资格
+> 与该活动不匹配，需排查（这正是 fail-close 要暴露的情况，而非 bug）。
 
 - 连续失败计数记在 `logs\health.json`（`consecutive_failures`），成功一次即清零。
 - 任何失败任务当轮的完整输出（不止日志摘要）写入 `logs\fail_<任务>_<时间>.txt`，用于追溯根因。
@@ -125,9 +131,16 @@ refreshToken 也失效，打开一次 Qoder CN 桌面端重新登录即可（凭
 
 ## 更新
 
-- git clone 方式：目录内 `git pull` 即可。计划任务指向目录路径，文件原地更新后
-  无需重装 `install.ps1`。
-- ZIP 方式：重新下载解压，覆盖到原目录。
+- git clone 方式：目录内 `git pull` 即可。**普通 Python 脚本更新无需重装计划任务**
+  （任务指向目录路径，文件原地生效）。
+- **若本次更新改动了 `install.ps1` / 调度时间**（例如新增触发点），`git pull` 不会
+  自动改变已注册的 Windows 计划任务——必须重新运行一次 installer 才会生效：
+  ```powershell
+  powershell -ExecutionPolicy Bypass -File .\install.ps1
+  ```
+  脚本用 `Register-ScheduledTask -Force`，会原地更新已有任务，不会重复创建。
+  可运行 `python check.py` 确认计划任务里已包含最新触发点（如 10:07）。
+- ZIP 方式：重新下载解压，覆盖到原目录（同样：涉及调度变更需重跑 `install.ps1`）。
 - 上游 `signin.py` / `trae_checkin.py` 发布新版时，可直接替换对应子目录文件。
 
 ## 开发与测试
@@ -138,8 +151,9 @@ python -m unittest tests.test_core    # 零依赖：退出码契约/轮签/失�
 
 子脚本退出码契约（调度器失败分类的依据）：`run_all.py` 0 全部成功；1 存在失败项。
 `trae_checkin.py` 0 成功/已签/软限流/未开放，1 硬失败或鉴权失败；`qoder_checkin.py`
-0 成功/已签/活动未开放，2 凭据缺失或解密失败，3 token 失效无法续期，4 签到请求失败
-或返回未知状态（疑似 API 改版，按可重试失败上报，绝不静默判成功）。
+0 成功/已签，2 凭据缺失或解密失败，3 token 失效无法续期，4 签到请求失败、活动未开放
+（DISABLED）或返回未知状态（一律 fail-close：`NOT_CLAIMED` 归需人工排查、`CLAIM_FAIL`
+归可重试，绝不静默判成功）。
 
 ## 卸载
 

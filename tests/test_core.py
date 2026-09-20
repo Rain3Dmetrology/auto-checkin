@@ -178,6 +178,13 @@ class TestClassifyOutcome(unittest.TestCase):
             "qoder", 4, '{"result": "CLAIM_FAIL", "error": "HTTP 503"}'),
             run_all.OUTCOME_RETRY)
 
+    def test_qoder_not_claimed_needs_human(self):
+        # fail-close：DISABLED/ENDED/未知状态 -> NOT_CLAIMED(exit4)，重试无意义，
+        # 归 NEEDS_HUMAN 让 check.py 立即暴露（而非无限 RETRY 拖延）。
+        self.assertEqual(run_all.classify_outcome(
+            "qoder", 4, '{"result": "NOT_CLAIMED", "error": "签到状态=DISABLED"}'),
+            run_all.OUTCOME_HUMAN)
+
     def test_unknown_task_retry(self):
         self.assertEqual(run_all.classify_outcome("other", 1, ""),
                          run_all.OUTCOME_RETRY)
@@ -290,8 +297,9 @@ class TestParseExpires(unittest.TestCase):
 # ── Qoder：签到状态机（服务端驱动，未知状态绝不假绿） ──────────
 class TestQoderStateMachine(unittest.TestCase):
     """契约：领取窗口由服务端 status 决定，不用本地自然日；
-    CLAIMED*→已领；CLAIMABLE→领取；已知 inactive→DISABLED(exit0)；
-    未知 status→FAIL(exit4)，绝不能伪装成 DISABLED/OK 造成静默漏签。
+    CLAIMED*→已领(exit0)；CLAIMABLE→领取；
+    其余一切状态（DISABLED/ENDED/NOT_STARTED/未知）→FAIL(exit4)，
+    绝不伪装成功——本任务目标是"真的领到 100"，未领取必须暴露而非静默绿。
     claim 仅在缺少显式成功证据时才复查一次 status（按需，不无条件双发）。"""
 
     OK, FAIL = qoder_checkin.EXIT_OK, qoder_checkin.EXIT_FAIL
@@ -300,7 +308,6 @@ class TestQoderStateMachine(unittest.TestCase):
         base = {"status": status,
                 "claimed": status in qoder_checkin.CLAIMED_STATUSES,
                 "claimable": status in qoder_checkin.CLAIMABLE_STATUSES,
-                "inactive": status in qoder_checkin.KNOWN_INACTIVE_STATUSES,
                 "streak_days": 3, "total_claim_days": 3,
                 "reward_credits": 100, "total_reward_credits": 300}
         base.update(extra)
@@ -335,10 +342,19 @@ class TestQoderStateMachine(unittest.TestCase):
         self.assertEqual(code, self.OK)
         self.assertEqual(res["result"], "ALREADY")
 
-    def test_known_inactive_returns_disabled_ok(self):
+    def test_disabled_fails_close_not_green(self):
+        # 核心防回归：live 曾返回 status=DISABLED 却与 GUI"已领取"矛盾，
+        # 未解释清楚前绝不能当成功；DISABLED 必须 fail-close 暴露问题。
+        code, res, calls = self._run([(True, self._st("DISABLED"))], (200, {}))
+        self.assertEqual(code, self.FAIL)
+        self.assertNotIn(res["result"], ("OK", "ALREADY", "DISABLED"))
+        self.assertEqual(calls["claim"], 0)
+
+    def test_ended_fails_close_not_green(self):
+        # 活动若真结束，应让 automation 报出来（任务已失去意义），而非每天假绿
         code, res, calls = self._run([(True, self._st("ENDED"))], (200, {}))
-        self.assertEqual(code, self.OK)
-        self.assertEqual(res["result"], "DISABLED")
+        self.assertEqual(code, self.FAIL)
+        self.assertNotIn(res["result"], ("OK", "ALREADY", "DISABLED"))
         self.assertEqual(calls["claim"], 0)
 
     def test_unknown_status_fails_loudly_not_disabled(self):
@@ -623,6 +639,38 @@ class TestPowerShellScriptBom(unittest.TestCase):
 
     def test_uninstall_ps1_has_bom(self):
         self.assertIn("AutoCheckin", self._read_bom("uninstall.ps1"))
+
+
+# ── 调度漂移防护：install.ps1 含 10:07 + check.py 能解析已注册触发器 ──
+class TestDailyTriggerDrift(unittest.TestCase):
+    """代码改了调度但已注册的 Windows 计划任务不会自动更新——隐性漂移。
+    install.ps1 必须含 10:07；check.py 必须能从 schtasks /xml 解析出已注册
+    触发器时间，以便发现"任务里缺 10:07"。"""
+
+    XML_WITH = (
+        "<Triggers>"
+        "<CalendarTrigger><StartBoundary>2026-09-21T00:23:00</StartBoundary></CalendarTrigger>"
+        "<CalendarTrigger><StartBoundary>2026-09-21T10:07:00</StartBoundary></CalendarTrigger>"
+        "</Triggers>")
+    XML_WITHOUT = (
+        "<Triggers>"
+        "<CalendarTrigger><StartBoundary>2026-09-21T00:23:00</StartBoundary></CalendarTrigger>"
+        "<CalendarTrigger><StartBoundary>2026-09-21T12:37:00</StartBoundary></CalendarTrigger>"
+        "</Triggers>")
+
+    def test_install_ps1_defines_1007(self):
+        with open(os.path.join(HERE, "install.ps1"), encoding="utf-8-sig") as fh:
+            self.assertIn("10:07", fh.read())
+
+    def test_parse_trigger_times(self):
+        self.assertEqual(check._parse_trigger_times(self.XML_WITH),
+                         {"00:23", "10:07"})
+
+    def test_parse_detects_missing_1007(self):
+        self.assertNotIn("10:07", check._parse_trigger_times(self.XML_WITHOUT))
+
+    def test_parse_empty_xml(self):
+        self.assertEqual(check._parse_trigger_times("<Task></Task>"), set())
 
 
 if __name__ == "__main__":

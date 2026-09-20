@@ -24,8 +24,9 @@
   python qoder_checkin.py status      仅查状态（调试）
   python qoder_checkin.py --json      JSON 行输出（供调度器解析）
 
-退出码：0 成功/已签/活动未开放；2 凭据缺失或解密失败；3 token 失效无法续期；
-        4 签到失败或返回未知状态（疑似 API 改版）。
+退出码：0 成功/已签；2 凭据缺失或解密失败；3 token 失效无法续期；
+        4 签到失败、活动未开放(DISABLED)或返回未知状态（一律 fail-close，
+          绝不把"未领取"伪装成成功，疑似 API 改版/资格不匹配时让失败暴露）。
 """
 
 import base64
@@ -440,9 +441,10 @@ def _api(path, method, token, uid, body=None, timeout=20):
 
 # 领取窗口由服务端 status 决定（活动按 10:00→次日10:00 分窗，不是本地自然日）。
 # 兼容已领取状态的多种枚举名，避免服务端小改动击穿自动化。
+# 注意：除 CLAIMED*/CLAIMABLE 外的一切状态（含 DISABLED/ENDED/未知）一律 fail-close，
+# 不当作成功——本任务目标是"真的领到 100"，未领取必须暴露而非静默绿。
 CLAIMED_STATUSES = {"CLAIMED", "CLAIMED_TODAY"}
 CLAIMABLE_STATUSES = {"CLAIMABLE"}
-KNOWN_INACTIVE_STATUSES = {"NOT_STARTED", "INACTIVE", "ENDED", "DISABLED"}
 
 
 def normalize_body(body):
@@ -466,7 +468,6 @@ def checkin_status(token, uid):
         "status": st,
         "claimed": st in CLAIMED_STATUSES,
         "claimable": st in CLAIMABLE_STATUSES,
-        "inactive": st in KNOWN_INACTIVE_STATUSES,
         "streak_days": int(b.get("currentStreakDays") or 0),
         "total_claim_days": int(b.get("totalClaimDays") or 0),
         "reward_credits": int(b.get("rewardCredits") or 0),
@@ -497,8 +498,8 @@ def do_checkin(token, uid):
 
     CLAIMED*  -> ALREADY（当前窗口已领，不再 POST）
     CLAIMABLE -> POST claim；缺显式成功证据时复查一次 status 确认
-    已知 inactive -> DISABLED（exit 0，活动确实未开放）
-    未知 status   -> FAIL（exit 4）——绝不伪装成功，防 API 改版后静默漏签
+    其余一切（DISABLED/ENDED/NOT_STARTED/未知）-> FAIL（exit 4）
+        绝不伪装成功：目标是"真的领到 100"，未领取必须暴露而非静默绿。
     """
     ok, st = checkin_status(token, uid)
     if not ok:
@@ -509,14 +510,14 @@ def do_checkin(token, uid):
                          "streak_days": st["streak_days"],
                          "reward_credits": st["reward_credits"]}
 
-    if st["inactive"]:
-        return EXIT_OK, {"result": "DISABLED",
-                         "msg": "官方签到活动未开放 (status=%s)" % st["status"]}
-
     if not st["claimable"]:
-        # 未知/新增状态：失败而非假绿，让 health 连续失败计数暴露问题
-        return EXIT_FAIL, {"result": "UNKNOWN_STATUS",
-                           "error": "未识别的签到状态 status=%r（疑似 API 改版）"
+        # fail-close：DISABLED/ENDED/未知状态都按失败上报，让 health 连续失败计数
+        # 暴露问题。曾观测到 live status=DISABLED 与桌面端"已领取"矛盾，未查清前
+        # 绝不当成功；活动若真结束也应报出来（任务已失去意义），而非每天假绿。
+        return EXIT_FAIL, {"result": "NOT_CLAIMED",
+                           "error": "签到状态=%r，未领取，按失败上报（不当作成功）。"
+                                    "若桌面端显示活动可领，疑似 status 接口语义/账号"
+                                    "资格与该活动不匹配，或 API 改版，需排查。"
                                     % st["status"]}
 
     status, body = _api(PATH_CLAIM, "POST", token, uid, body=b"{}")
@@ -585,7 +586,7 @@ def main():
         log_line({"cmd": cmd, "uid": uid[:8] if uid else "",
                   "nickname": nickname, **result})
     else:
-        icon = {"OK": "[+]", "ALREADY": "[=]", "DISABLED": "[-]"}.get(result["result"], "[!]")
+        icon = {"OK": "[+]", "ALREADY": "[=]"}.get(result["result"], "[!]")
         print("%s Qoder CN: %s" % (icon, result.get("msg") or result.get("error")))
         if result.get("streak_days") is not None:
             print("    连签 %s 天" % result["streak_days"])

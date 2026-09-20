@@ -331,8 +331,9 @@ def classify_outcome(name, code, output):
       workbuddy  0 成功；1 NO_SESSION(需人工)/NETWORK/TIMEOUT(可重试)/ERROR；
                  2 NO_AUTH(未装未登录)/凭据损坏(需人工)
       trae      0 成功/已签/待重试限流/未开放；1 硬失败或鉴权失败（stdout 有摘要）
-      qoder     0 成功/已签/未开放；2 未装(跳过)或解密失败(需人工)；
-                 3 refreshToken 失效(需人工)；4 签到请求失败(多为瞬时)
+      qoder     0 成功/已签；2 未装(跳过)或解密失败(需人工)；
+                 3 refreshToken 失效(需人工)；4 签到请求失败(多为瞬时)，
+                 其中 NOT_CLAIMED(活动未开放/状态异常)归需人工排查
     """
     if code == 0:
         return OUTCOME_OK
@@ -359,6 +360,8 @@ def classify_outcome(name, code, output):
             return OUTCOME_HUMAN         # 解密失败/凭据损坏
         if code == 3:
             return OUTCOME_HUMAN         # refreshToken 也失效，需重新登录
+        if "NOT_CLAIMED" in out:
+            return OUTCOME_HUMAN         # 活动未开放/状态异常，重试无意义，需排查
         return OUTCOME_RETRY             # 4 = 请求失败，多为瞬时
 
     return OUTCOME_RETRY
