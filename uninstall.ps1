@@ -1,4 +1,4 @@
-# uninstall.ps1 — 卸载三合一自动签到的两个计划任务
+﻿# uninstall.ps1 — 卸载三合一自动签到的两个计划任务
 # 用法：powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
 
 $ErrorActionPreference = "Continue"

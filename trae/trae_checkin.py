@@ -1021,6 +1021,20 @@ GAP_MIN, GAP_MAX = 12, 25        # 实测 25s 间隔可让相邻账号连续签�
 
 
 def main():
+    # Windows 管道/无控制台（计划任务 pythonw）下 stdio 默认走 locale 编码
+    # （简体中文 = GBK），本脚本大量 emoji 输出会直接 UnicodeEncodeError 崩掉
+    # 整轮签到。与 qoder_checkin.py 保持同一写法：强制 stdio 走 UTF-8。
+    # stderr 同样防护：无凭据/配置错误等提示也带 emoji，且 run_all.py 把
+    # stderr 合并入 stdout 管道统一按 UTF-8 解码（两边分开 try：pythonw 下
+    # sys.stdout 可能为 None，不能因一个流不可用放弃另一个）。
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
     accounts = load_accounts()
     cache = load_cache()
     log_title(len(accounts))

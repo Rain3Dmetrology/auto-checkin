@@ -70,8 +70,12 @@ def check_workbuddy():
     try:
         with open(found, encoding="utf-8") as fh:
             d = json.load(fh)
+        # 真实凭据把令牌嵌在 auth.accessToken（顶层无 token 键），
+        # 只查顶层会稳定输出误导性的"结构与预期不同"。
         if isinstance(d, dict) and ("accessToken" in d or "token" in d
-                                    or "session" in d):
+                                    or "session" in d
+                                    or (isinstance(d.get("auth"), dict)
+                                        and d["auth"].get("accessToken"))):
             ok("凭据文件可读: %s" % found)
         else:
             info("凭据文件存在但结构与预期不同（signin.py 会自行解析）: %s" % found)

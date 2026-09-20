@@ -1,4 +1,4 @@
-# install.ps1 — 三合一自动签到一键安装（Windows 计划任务）
+﻿# install.ps1 — 三合一自动签到一键安装（Windows 计划任务）
 #
 # 整合 88lin/workbuddy-auto-signin 的安装逻辑（MIT），统一调度
 # WorkBuddy + Trae + Qoder CN 三个签到脚本。

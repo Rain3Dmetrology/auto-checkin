@@ -371,6 +371,7 @@ def update_health(state, name, outcome, error=""):
     if outcome == OUTCOME_OK:
         rec["consecutive_failures"] = 0
         rec["last_success"] = _now()
+        rec.pop("last_error", None)    # 成功即清残留错误，避免误导排查
     else:
         rec["consecutive_failures"] = int(rec.get("consecutive_failures") or 0) + 1
         rec["last_failure"] = _now()

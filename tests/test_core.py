@@ -2,16 +2,21 @@
 # -*- coding: utf-8 -*-
 """核心逻辑单元测试（零依赖，python -m unittest tests.test_core）。
 
-覆盖四类关键契约：
+覆盖六类关键契约：
   1. Trae 退出码契约（summarize_results）：软限流不算失败，鉴权失败必须非 0
   2. pick_batch 轮签（TRAE_BATCH 数字解析；历史缺陷：size 未定义导致 NameError）
   3. run_all 失败分类（classify_outcome）与连续失败计数（update_health）
   4. 手写 AES（CBC-128 / GCM-256）NIST 已知向量防回归
+  5. GBK 管道 UTF-8 防护（D1：计划任务 pythonw 下 emoji 输出崩溃）
+  6. 部署体检（check_workbuddy 凭据结构）与 ps1 BOM（D2/D3/D4）
 """
 
 import datetime as _dt
+import io
+import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -25,6 +30,7 @@ sys.path.insert(0, os.path.join(HERE, "qoder"))
 import run_all        # noqa: E402
 import trae_checkin   # noqa: E402
 import qoder_checkin  # noqa: E402
+import check          # noqa: E402
 
 
 def _mk_result(status, name="t", detail=""):
@@ -330,6 +336,147 @@ class TestAesVectors(unittest.TestCase):
         sealed = self.GCM_CT + bytes(b ^ 0x01 for b in self.GCM_TAG)
         with self.assertRaises(ValueError):
             qoder_checkin.aes_gcm_decrypt(self.GCM_KEY, self.GCM_IV, sealed)
+
+
+# ── D1 回归：GBK 管道 UTF-8 防护（计划任务 pythonw 场景） ──────
+class TestGbkPipeUtf8Guard(unittest.TestCase):
+    """历史缺陷 D1：计划任务以 pythonw + 管道运行时，子进程 stdio 走 locale
+    编码（中文 Windows = GBK），脚本大量 emoji 输出直接 UnicodeEncodeError
+    崩掉整轮签到；本地直跑因宿主注入 PYTHONUTF8=1 而假绿。
+    run_all.py 按 UTF-8 解码子进程输出且把 stderr 合并入 stdout 管道，
+    故子进程必须在 main() 入口强制 stdio 走 UTF-8（与 qoder/check.py 同款）。
+
+    复现方式：子进程设 PYTHONIOENCODING=gbk（等价于无控制台管道 + ACP=936）。
+    通过当日"已签"状态文件构造零网络路径，无需任何真实凭据。"""
+
+    def _run_under_gbk(self, extra_env=None):
+        env = {k: v for k, v in os.environ.items()
+               if not (k.startswith("TRAE_")
+                       or k in ("PYTHONUTF8", "PYTHONIOENCODING", "PLUSPLUS_TOKEN"))}
+        env["PYTHONIOENCODING"] = "gbk"
+        env.update(extra_env or {})
+        return subprocess.run(
+            [sys.executable, os.path.join(HERE, "trae", "trae_checkin.py")],
+            cwd=os.path.join(HERE, "trae"), env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
+
+    def test_stdout_emoji_survives_gbk_pipe(self):
+        # D1 原始崩溃点：log_title/☑️/✅ 摘要全走 stdout
+        key = "gbktest"
+        backup = None
+        if os.path.isfile(trae_checkin.STATE_FILE):
+            with open(trae_checkin.STATE_FILE, encoding="utf-8") as fh:
+                backup = fh.read()
+        try:
+            with open(trae_checkin.STATE_FILE, "w", encoding="utf-8") as fh:
+                json.dump({"date": trae_checkin.today_str(),
+                           "done": {key: {"status": "已签到", "credits": "-",
+                                          "at": "test"}},
+                           "cooldown": {}}, fh)
+            proc = self._run_under_gbk({
+                "TRAE_UID": key, "TRAE_ACCESS_TOKEN": "dummy",
+                "TRAE_JITTER": "0"})
+        finally:
+            if backup is None:
+                if os.path.isfile(trae_checkin.STATE_FILE):
+                    os.remove(trae_checkin.STATE_FILE)
+            else:
+                with open(trae_checkin.STATE_FILE, "w", encoding="utf-8") as fh:
+                    fh.write(backup)
+        out = proc.stdout.decode("utf-8", "replace")
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("账号数量", out)          # log_title 正常渲染（非乱码/崩溃）
+        self.assertNotIn("UnicodeEncodeError", out)
+
+    def test_stderr_emoji_survives_gbk_pipe(self):
+        # 无凭据终态：❌ 提示走 stderr（run_all 将其合并入同一管道）
+        proc = self._run_under_gbk()
+        out = proc.stdout.decode("utf-8", "replace")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("未找到账号配置", out)
+        self.assertNotIn("UnicodeEncodeError", out)
+
+
+# ── D3 回归：check_workbuddy 嵌套凭据结构误报 ──────────────────
+class TestCheckWorkbuddyAuth(unittest.TestCase):
+    """历史缺陷 D3：真实凭据文件把令牌嵌在 auth.accessToken（顶层无
+    token 键），check_workbuddy() 只查顶层导致稳定输出误导性的
+    "结构与预期不同"。"""
+
+    def _with_auth_file(self, payload):
+        fd, path = tempfile.mkstemp(suffix=".info")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        saved = os.environ.get("WORKBUDDY_AUTH_FILE")
+        os.environ["WORKBUDDY_AUTH_FILE"] = path
+        try:
+            buf = io.StringIO()
+            with mock.patch("sys.stdout", new=buf):
+                check.check_workbuddy()
+            return buf.getvalue()
+        finally:
+            if saved is None:
+                os.environ.pop("WORKBUDDY_AUTH_FILE", None)
+            else:
+                os.environ["WORKBUDDY_AUTH_FILE"] = saved
+            os.remove(path)
+
+    def test_nested_auth_access_token_recognized(self):
+        out = self._with_auth_file({
+            "account": {"nick": "n"},
+            "auth": {"accessToken": "t", "refreshToken": "r", "expiresAt": 1},
+            "accounts": [],
+        })
+        self.assertIn("凭据文件可读", out)
+        self.assertNotIn("结构与预期不同", out)
+
+    def test_top_level_still_recognized(self):
+        out = self._with_auth_file({"accessToken": "t"})
+        self.assertIn("凭据文件可读", out)
+
+
+# ── D4 回归：成功后 health.json 残留 last_error ───────────────
+class TestHealthLastErrorCleanup(unittest.TestCase):
+    """历史缺陷 D4：update_health() 成功分支只清零计数不清 last_error，
+    恢复后 health.json 仍残留历史错误文本。"""
+
+    def test_success_clears_last_error(self):
+        state = {"x": {"outcome": run_all.OUTCOME_RETRY,
+                       "consecutive_failures": 2,
+                       "last_failure": "2026-09-20 22:00:00",
+                       "last_error": "UnicodeEncodeError: 'gbk' codec"}}
+        run_all.update_health(state, "x", run_all.OUTCOME_OK)
+        rec = state["x"]
+        self.assertEqual(rec["consecutive_failures"], 0)
+        self.assertNotIn("last_error", rec)
+
+    def test_failure_keeps_last_error(self):
+        state = {}
+        run_all.update_health(state, "x", run_all.OUTCOME_RETRY,
+                               error="boom")
+        self.assertEqual(state["x"]["last_error"], "boom")
+
+
+# ── D2 回归：安装脚本必须是 UTF-8 with BOM ────────────────────
+class TestPowerShellScriptBom(unittest.TestCase):
+    """历史缺陷 D2：ps1 为 UTF-8 无 BOM 时，Windows PowerShell 5.1 按 ANSI
+    （中文系统 = GBK）解析中文注释，解析器直接崩坏（报错行与实际问题无关），
+    安装/卸载双路径全坏。BOM 是唯一跨 PS5.1/pwsh7 的可靠标记。"""
+
+    def _read_bom(self, name):
+        path = os.path.join(HERE, name)
+        with open(path, "rb") as fh:
+            head = fh.read(3)
+        self.assertEqual(head, b"\xef\xbb\xbf",
+                         "%s 缺少 UTF-8 BOM（PS5.1 会按 ANSI 误解析）" % name)
+        with open(path, encoding="utf-8-sig") as fh:
+            return fh.read()
+
+    def test_install_ps1_has_bom(self):
+        self.assertIn("AutoCheckinDaily", self._read_bom("install.ps1"))
+
+    def test_uninstall_ps1_has_bom(self):
+        self.assertIn("AutoCheckin", self._read_bom("uninstall.ps1"))
 
 
 if __name__ == "__main__":

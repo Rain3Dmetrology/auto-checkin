@@ -27,6 +27,10 @@ python check.py
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
+> **编码注意**：`install.ps1` / `uninstall.ps1` 均为 **UTF-8 with BOM**。
+> Windows PowerShell 5.1 对无 BOM 的 UTF-8 会按 ANSI（中文系统 = GBK）解析，
+> 中文注释会直接导致语法错误。用编辑器修改这两个脚本后另存时，务必保留 BOM。
+
 安装完成后立即手动跑一轮看效果（控制台直接可见输出）：
 
 ```powershell
