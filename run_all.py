@@ -17,6 +17,13 @@
   python run_all.py --only trae|workbuddy|qoder    只跑指定软件
 
 退出码：0 全部成功（含已签/跳过）；1 存在失败项。
+
+失败三态（logs/health.json 持续跟踪）：
+  OK          本轮成功 / 设计内跳过（未安装、未登录、活动未开放）
+  RETRY       瞬时失败（网络、超时、服务端 5xx）——计划任务每小时自动补，
+              连续多次失败会体现在 health.json 的 consecutive_failures
+  NEEDS_HUMAN 硬失败（会话失效、凭据损坏）——重试无意义，需人工重新登录；
+              完整输出会落到 logs/fail_<任务>_<时间>.txt 供追溯
 """
 
 import base64
@@ -30,6 +37,7 @@ import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(HERE, "logs")
+HEALTH_FILE = os.path.join(LOG_DIR, "health.json")
 PYTHON = sys.executable or "pythonw.exe"
 
 SUBPROC_TIMEOUT = 10 * 60        # 单个子任务最长 10 分钟
@@ -282,7 +290,8 @@ def wait_for_network(seconds):
 
 
 def run_child(name, script, args, env_extra=None, cwd=None):
-    """执行子脚本，输出汇入统一日志。返回 (exit_code, tail_lines)。"""
+    """执行子脚本，输出汇入统一日志。返回 (exit_code, 完整输出)。
+    完整输出保留给失败分类与失败落盘，日志里只打尾部 6 行摘要。"""
     env = os.environ.copy()
     if env_extra:
         env.update(env_extra)
@@ -298,15 +307,141 @@ def run_child(name, script, args, env_extra=None, cwd=None):
         code = proc.returncode
     except subprocess.TimeoutExpired:
         log("%s 超时（>%d 分钟），已终止" % (name, SUBPROC_TIMEOUT // 60))
-        return 1, []
+        return 1, ""
     except Exception as exc:
         log("%s 启动失败: %s" % (name, exc))
-        return 1, []
+        return 1, ""
     tail = [l for l in out.splitlines() if l.strip()][-6:]
     for line in tail:
         log("  %s | %s" % (name, line))
     log("%s 结束 (exit=%d)" % (name, code))
-    return code, tail
+    return code, out
+
+
+# ---------------------------------------------------------------------------
+# 失败三态分类与运行健康（详见文件头说明）
+# ---------------------------------------------------------------------------
+OUTCOME_OK = "OK"
+OUTCOME_RETRY = "RETRY"
+OUTCOME_HUMAN = "NEEDS_HUMAN"
+
+
+def classify_outcome(name, code, output):
+    """把子任务 (退出码, 输出) 归入三态。判定依据是各子脚本的退出码契约：
+      workbuddy  0 成功；1 NO_SESSION(需人工)/NETWORK/TIMEOUT(可重试)/ERROR；
+                 2 NO_AUTH(未装未登录)/凭据损坏(需人工)
+      trae      0 成功/已签/待重试限流/未开放；1 硬失败或鉴权失败（stdout 有摘要）
+      qoder     0 成功/已签/未开放；2 未装(跳过)或解密失败(需人工)；
+                 3 refreshToken 失效(需人工)；4 签到请求失败(多为瞬时)
+    """
+    if code == 0:
+        return OUTCOME_OK
+    out = output or ""
+
+    if name == "workbuddy":
+        if "NO_SESSION" in out:
+            return OUTCOME_HUMAN
+        if "NETWORK" in out or "TIMEOUT" in out:
+            return OUTCOME_RETRY
+        if code == 2:
+            return OUTCOME_OK if "NO_AUTH" in out else OUTCOME_HUMAN
+        return OUTCOME_RETRY
+
+    if name == "trae":
+        if "鉴权失败" in out:
+            return OUTCOME_HUMAN
+        return OUTCOME_RETRY
+
+    if name == "qoder":
+        if code == 2:
+            if "找不到" in out:
+                return OUTCOME_OK       # 未安装/未登录，设计内跳过
+            return OUTCOME_HUMAN         # 解密失败/凭据损坏
+        if code == 3:
+            return OUTCOME_HUMAN         # refreshToken 也失效，需重新登录
+        return OUTCOME_RETRY             # 4 = 请求失败，多为瞬时
+
+    return OUTCOME_RETRY
+
+
+def update_health(state, name, outcome, error=""):
+    """更新单个任务的运行健康记录：连续失败计数 + 最近成功/失败时间。"""
+    rec = state.setdefault(name, {})
+    rec["outcome"] = outcome
+    if outcome == OUTCOME_OK:
+        rec["consecutive_failures"] = 0
+        rec["last_success"] = _now()
+    else:
+        rec["consecutive_failures"] = int(rec.get("consecutive_failures") or 0) + 1
+        rec["last_failure"] = _now()
+        if error:
+            rec["last_error"] = str(error)[:200]
+    return state
+
+
+def load_health():
+    try:
+        with open(HEALTH_FILE, encoding="utf-8") as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_health(state):
+    """原子写（临时文件 + replace），进程被杀不留半截 JSON。"""
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        tmp = HEALTH_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, HEALTH_FILE)
+    except Exception as exc:
+        log("健康状态写入失败: %s" % exc)
+
+
+def _last_error_line(output):
+    lines = [l for l in (output or "").splitlines() if l.strip()]
+    return lines[-1][:200] if lines else ""
+
+
+def _write_failure_dump(name, output, timestamp=None):
+    """失败任务的完整输出落盘：统一日志只有尾部 6 行，定位根因常需全量。"""
+    os.makedirs(LOG_DIR, exist_ok=True)
+    ts = timestamp or _now()
+    path = os.path.join(
+        LOG_DIR, "fail_%s_%s.txt" % (name, time.strftime("%Y%m%d_%H%M%S")))
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("[task] %s\n[failed_at] %s\n[output]\n%s\n" % (name, ts, output or ""))
+    return path
+
+
+def _read_file_from(path, offset):
+    """二进制读文件 offset 之后的新增内容；文件被轮转清空则从头读。"""
+    try:
+        if not os.path.isfile(path):
+            return ""
+        with open(path, "rb") as fh:
+            if os.fstat(fh.fileno()).st_size < offset:
+                offset = 0
+            fh.seek(offset)
+            return fh.read().decode("utf-8", "replace")
+    except Exception:
+        return ""
+
+
+def _finish_task(name, code, output):
+    """子任务收尾：三态分类 -> 健康计数 -> 失败时全量落盘。返回调度退出码。"""
+    outcome = classify_outcome(name, code, output)
+    health = load_health()
+    update_health(health, name, outcome, _last_error_line(output))
+    save_health(health)
+    if outcome == OUTCOME_OK:
+        return 0
+    dump = _write_failure_dump(name, output)
+    log("%s 本轮结果=%s（exit=%s），完整输出: %s"
+        % (name, outcome, code, os.path.basename(dump)))
+    return 1
 
 
 def task_workbuddy(poll=False):
@@ -315,14 +450,16 @@ def task_workbuddy(poll=False):
         log("workbuddy 跳过：signin.py 不存在")
         return 0, None
     mode = "silent-poll" if poll else "silent"
-    code, tail = run_child("workbuddy", script, [mode])
-    # signin.py 退出码：0 成功；1 会话失效（需重新登录桌面端）；2 环境类
-    # （NO_AUTH / 未安装 / 凭据损坏）。未部署该软件不应拖垮整体退出码。
-    if code in (0, 2):
-        if code == 2:
-            log("workbuddy 无可用凭据（未安装或未登录），本轮跳过")
-        return 0, None
-    return 1, None
+    # signin.py 的 silent 模式把 JSON 结果写进自己的日志文件而非 stdout，
+    # 记下运行前长度、跑完只取新增部分作为分类依据（不混入历史轮次）。
+    log_path = os.environ.get("WORKBUDDY_SIGNIN_LOG") or os.path.join(
+        os.path.dirname(script), "signin.log")
+    before = os.path.getsize(log_path) if os.path.isfile(log_path) else 0
+    code, out = run_child("workbuddy", script, [mode])
+    fresh = _read_file_from(log_path, before)
+    if fresh:
+        out = (out + "\n" if out else "") + fresh
+    return _finish_task("workbuddy", code, out), None
 
 
 def task_trae(poll=None):
@@ -330,7 +467,13 @@ def task_trae(poll=None):
     if not os.path.isfile(script):
         log("trae 跳过：trae_checkin.py 不存在")
         return 0, None
-    cred = load_trae_credential()
+    try:
+        cred = load_trae_credential()
+    except Exception as exc:
+        # storage.json 损坏/解密失败属于需人工处理的硬失败，但绝不能让
+        # 异常冒泡杀掉整轮调度（后面的 qoder 还要照常跑）。
+        log("trae 凭据解密异常: %s" % exc)
+        return _finish_task("trae", 1, "trae 凭据解密异常: %s" % exc), None
     if cred.get("error"):
         log("trae 跳过：%s" % cred["error"])
         return 0, None     # 未装/未登录不算失败，避免拖累整体退出码
@@ -343,10 +486,10 @@ def task_trae(poll=None):
         env["TRAE_NAME"] = cred["nickname"]
     log("trae 凭据已解出（账号 %s，来源 %s）"
         % (cred.get("nickname") or cred.get("uid") or "?",
-           os.path.basename(os.path.dirname(os.path.dirname(cred["path"])))))
-    code, tail = run_child("trae", script, [], env_extra=env)
-    # trae_checkin.py：0=全部成功；非0表示有失败/异常
-    return (0 if code == 0 else 1), None
+           os.path.basename(os.path.dirname(os.path.dirname(cred["path"]))))
+    code, out = run_child("trae", script, [], env_extra=env)
+    # trae_checkin.py：0=成功/已签/待重试限流/未开放；1=硬失败或鉴权失败
+    return _finish_task("trae", code, out), None
 
 
 def task_qoder(poll=None):
@@ -354,14 +497,9 @@ def task_qoder(poll=None):
     if not os.path.isfile(script):
         log("qoder 跳过：qoder_checkin.py 不存在")
         return 0, None
-    code, tail = run_child("qoder", script, ["--json"])
-    # 退出码：0 成功/已签；2 未登录；3 token失效；4 签到失败
-    if code in (0,):
-        return 0, None
-    if code == 2:
-        log("qoder 未登录或凭据解密失败（详见 qoder/checkin.log）")
-        return 0, None     # 未装/未登录不算失败
-    return 1, None
+    code, out = run_child("qoder", script, ["--json"])
+    # 退出码：0 成功/已签/未开放；2 未登录或解密失败；3 token失效；4 签到失败
+    return _finish_task("qoder", code, out), None
 
 
 TASKS = {"workbuddy": task_workbuddy, "trae": task_trae, "qoder": task_qoder}
@@ -386,7 +524,12 @@ def main():
     names = [only] if only in TASKS else ["workbuddy", "trae", "qoder"]
     failed = []
     for n in names:
-        rc, _ = TASKS[n](poll)
+        try:
+            rc, _ = TASKS[n](poll)
+        except Exception as exc:
+            # 调度层兜底：任何任务的意外异常只算它自己失败，绝不波及后续任务
+            log("%s 调度异常: %s" % (n, exc))
+            rc = 1
         if rc:
             failed.append(n)
 

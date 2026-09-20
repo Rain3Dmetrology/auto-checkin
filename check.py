@@ -155,6 +155,33 @@ def check_tasks():
             info("%s 查询失败" % name)
 
 
+def check_health():
+    section("运行健康（连续失败计数，logs\\health.json）")
+    health = run_all.load_health()
+    if not health:
+        info("尚无运行记录：安装后会随每轮签到自动累积")
+        return
+    for name in ("workbuddy", "trae", "qoder"):
+        rec = health.get(name)
+        if not rec:
+            info("%s: 暂无记录" % name)
+            continue
+        fails = int(rec.get("consecutive_failures") or 0)
+        last_ok = rec.get("last_success") or "从未成功"
+        if fails == 0:
+            ok("%s: 正常（最近成功 %s）" % (name, last_ok))
+            continue
+        msg = "%s: 已连续失败 %d 次（最近成功 %s）" % (name, fails, last_ok)
+        # NEEDS_HUMAN（凭据/会话失效）重试无意义；连续 >=5 次也该人工看一眼
+        if rec.get("outcome") == run_all.OUTCOME_HUMAN or fails >= 5:
+            bad(msg)
+            bad("  最近错误: %s" % (rec.get("last_error") or "?"))
+            info("  排查: python run_all.py --only %s 看完整输出；"
+                 "凭据类失败需重新登录对应客户端" % name)
+        else:
+            info("%s —— 多为瞬时网络/限流，下一个触发点自动补签" % msg)
+
+
 def main():
     print("三合一自动签到 · 部署体检  (%s)" % time.strftime("%Y-%m-%d %H:%M:%S"))
     check_python()
@@ -163,6 +190,7 @@ def main():
     check_qoder()
     check_network()
     check_tasks()
+    check_health()
     print("\n体检完成。手动试跑一轮签到（控制台可见输出）：")
     print("  python \"%s\"" % os.path.join(HERE, "run_all.py"))
     print("查看日志: %s" % os.path.join(HERE, "logs"))
