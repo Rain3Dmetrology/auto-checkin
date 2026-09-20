@@ -8,10 +8,13 @@
 #
 # 创建两个计划任务（全部静默、无窗口、错过自动补跑）：
 #   AutoCheckinBoot   用户登录后 90 秒    开机即签（等网络就绪）
-#   AutoCheckinDaily  每天 00:23 / 08:07 / 12:37 / 19:07 / 22:37（随机延迟数分钟错峰）
+#   AutoCheckinDaily  每天 00:23 / 08:07 / 10:07 / 12:37 / 19:07 / 22:37（随机延迟数分钟错峰）
 #
 # 说明：
 #   - 00:23 是 Trae 的最佳签到窗口（避开 00:00-00:10 整点排队限流高峰）
+#   - 10:07 对齐 Qoder CN「每日 10:00 开放新一轮领取」窗口（错过当日不补领），
+#     故意取 10:07 + 0-5 分钟抖动而非整点，避开开放瞬间的服务端拥塞
+#   - 08:07 是上一个 Qoder 领取窗口（昨日 10:00→今日 10:00）的最后兜底，勿删
 #   - 后续时间点为补签兜底：三个签到全部幂等（已签自动跳过，零多余请求）
 #   - 必须以当前用户身份运行（DPAPI 解密 Qoder 凭据依赖用户上下文）
 
@@ -110,10 +113,11 @@ try {
 
     # 任务 2：每日定时 + 多次补签（独立 Daily 触发器：实测“Daily+间隔重复”的重复
     # 实例一旦错过就永久跳过，独立触发器配合 StartWhenAvailable 每次都能补跑）
-    #   00:23  Trae 最佳窗口（避开整点高峰）；其余为幂等补签兜底
+    #   00:23  Trae 最佳窗口（避开整点高峰）；10:07 对齐 Qoder 每日 10:00 开放窗口；
+    #   08:07 为上一 Qoder 窗口最后兜底；其余为幂等补签兜底
     #   -RandomDelay 再加 0-5 分钟随机抖动，避免与同批用户撞车
     $triD = @()
-    foreach ($hh in @("00:23", "08:07", "12:37", "19:07", "22:37")) {
+    foreach ($hh in @("00:23", "08:07", "10:07", "12:37", "19:07", "22:37")) {
         $t = New-ScheduledTaskTrigger -Daily -At $hh -RandomDelay (New-TimeSpan -Minutes 5)
         $triD += $t
     }
@@ -138,7 +142,7 @@ Write-Host ""
 Write-Host "两个计划任务已就位：" -ForegroundColor Green
 foreach ($row in @(
     @{ Name = "AutoCheckinBoot";  When = "每次登录后90秒" },
-    @{ Name = "AutoCheckinDaily"; When = "00:23/08:07/12:37/19:07/22:37" }
+    @{ Name = "AutoCheckinDaily"; When = "00:23/08:07/10:07/12:37/19:07/22:37" }
 )) {
     $t = Get-ScheduledTask -TaskName $row.Name
     $i = Get-ScheduledTaskInfo -TaskName $row.Name

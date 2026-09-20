@@ -43,10 +43,16 @@ python run_all.py
 |------|---------|------|
 | AutoCheckinBoot | 每次登录后 90 秒 | 等网络就绪后签到（开机即签） |
 | AutoCheckinDaily | 每天 00:23 | 主力签到（Trae 避开整点限流高峰） |
-| AutoCheckinDaily | 08:07 / 12:37 / 19:07 / 22:37 | 补签兜底（已签自动跳过，零多余请求） |
+| AutoCheckinDaily | 10:07 | 对齐 Qoder CN 每日 10:00 开放的新一轮领取窗口 |
+| AutoCheckinDaily | 08:07 / 12:37 / 19:07 / 22:37 | 补签兜底（已签自动跳过，无多余领取请求） |
 
 所有触发点带 0-5 分钟随机抖动错峰；关机/睡眠错过的时间点，开机后自动补跑
 （StartWhenAvailable）。
+
+> **Qoder 物理限制**：官方活动每日 10:00 开新窗口、持续至次日 10:00，**错过不可补领、
+> 不累计**。`StartWhenAvailable` 只能让 Windows 任务在开机后补跑，无法让 Qoder 把已关闭
+> 的上一轮奖励补回来；且计划任务以 `Interactive`（当前登录用户）身份运行（DPAPI 解密
+> 凭据依赖用户上下文），故需保证每个领取窗口内电脑至少有一次开机并登录。
 
 ## 工作原理
 
@@ -127,12 +133,13 @@ refreshToken 也失效，打开一次 Qoder CN 桌面端重新登录即可（凭
 ## 开发与测试
 
 ```powershell
-python -m unittest tests.test_core    # 零依赖，45 项：退出码契约/轮签/失败分类/健康计数/AES 向量
+python -m unittest tests.test_core    # 零依赖：退出码契约/轮签/失败分类/健康计数/Qoder 状态机/AES 向量
 ```
 
 子脚本退出码契约（调度器失败分类的依据）：`run_all.py` 0 全部成功；1 存在失败项。
 `trae_checkin.py` 0 成功/已签/软限流/未开放，1 硬失败或鉴权失败；`qoder_checkin.py`
-0 成功/已签/未开放，2 凭据缺失或解密失败，3 token 失效无法续期，4 签到请求失败。
+0 成功/已签/活动未开放，2 凭据缺失或解密失败，3 token 失效无法续期，4 签到请求失败
+或返回未知状态（疑似 API 改版，按可重试失败上报，绝不静默判成功）。
 
 ## 卸载
 

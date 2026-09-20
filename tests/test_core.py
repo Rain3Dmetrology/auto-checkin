@@ -263,13 +263,21 @@ class TestParseExpires(unittest.TestCase):
         self.assertEqual(qoder_checkin._parse_expires("1758307200000"), 1758307200)
 
     def test_rfc3339(self):
-        expected = int(_dt.datetime(2026, 9, 20, 0, 0, 0).timestamp())
+        # Z 后缀是 UTC，必须按 UTC 解析（历史 bug：曾当本地时间，差一个时区偏移）
+        expected = int(_dt.datetime(2026, 9, 20, 0, 0, 0,
+                                    tzinfo=_dt.timezone.utc).timestamp())
         self.assertEqual(qoder_checkin._parse_expires("2026-09-20T00:00:00Z"), expected)
 
     def test_rfc3339_millis(self):
         v = qoder_checkin._parse_expires("2026-09-20T12:34:56.789Z")
-        base = int(_dt.datetime(2026, 9, 20, 12, 34, 56).timestamp())
+        base = int(_dt.datetime(2026, 9, 20, 12, 34, 56,
+                                tzinfo=_dt.timezone.utc).timestamp())
         self.assertTrue(base <= v < base + 1)
+
+    def test_rfc3339_no_offset_treated_as_local(self):
+        # 无 Z/偏移的裸时间保持本地语义（与桌面端一致）
+        expected = int(_dt.datetime(2026, 9, 20, 0, 0, 0).timestamp())
+        self.assertEqual(qoder_checkin._parse_expires("2026-09-20T00:00:00"), expected)
 
     def test_invalid_returns_zero(self):
         self.assertEqual(qoder_checkin._parse_expires("not-a-date"), 0)
@@ -277,6 +285,133 @@ class TestParseExpires(unittest.TestCase):
     def test_empty_returns_zero(self):
         self.assertEqual(qoder_checkin._parse_expires(""), 0)
         self.assertEqual(qoder_checkin._parse_expires(None), 0)
+
+
+# ── Qoder：签到状态机（服务端驱动，未知状态绝不假绿） ──────────
+class TestQoderStateMachine(unittest.TestCase):
+    """契约：领取窗口由服务端 status 决定，不用本地自然日；
+    CLAIMED*→已领；CLAIMABLE→领取；已知 inactive→DISABLED(exit0)；
+    未知 status→FAIL(exit4)，绝不能伪装成 DISABLED/OK 造成静默漏签。
+    claim 仅在缺少显式成功证据时才复查一次 status（按需，不无条件双发）。"""
+
+    OK, FAIL = qoder_checkin.EXIT_OK, qoder_checkin.EXIT_FAIL
+
+    def _st(self, status, **extra):
+        base = {"status": status,
+                "claimed": status in qoder_checkin.CLAIMED_STATUSES,
+                "claimable": status in qoder_checkin.CLAIMABLE_STATUSES,
+                "inactive": status in qoder_checkin.KNOWN_INACTIVE_STATUSES,
+                "streak_days": 3, "total_claim_days": 3,
+                "reward_credits": 100, "total_reward_credits": 300}
+        base.update(extra)
+        return base
+
+    def _run(self, status_seq, claim_resp):
+        """status_seq: checkin_status 依次返回的 (ok, st)；claim_resp: _api 返回。"""
+        calls = {"status": 0, "claim": 0}
+
+        def fake_status(token, uid):
+            i = min(calls["status"], len(status_seq) - 1)
+            calls["status"] += 1
+            return status_seq[i]
+
+        def fake_api(path, method, token, uid, body=None, timeout=20):
+            calls["claim"] += 1
+            return claim_resp
+
+        with mock.patch.object(qoder_checkin, "checkin_status", fake_status), \
+                mock.patch.object(qoder_checkin, "_api", fake_api):
+            code, result = qoder_checkin.do_checkin("dt-x", "uid1")
+        return code, result, calls
+
+    def test_claimed_returns_already_without_posting(self):
+        code, res, calls = self._run([(True, self._st("CLAIMED"))], (200, {}))
+        self.assertEqual(code, self.OK)
+        self.assertEqual(res["result"], "ALREADY")
+        self.assertEqual(calls["claim"], 0)          # 已领绝不再 POST
+
+    def test_claimed_today_alias_returns_already(self):
+        code, res, _ = self._run([(True, self._st("CLAIMED_TODAY"))], (200, {}))
+        self.assertEqual(code, self.OK)
+        self.assertEqual(res["result"], "ALREADY")
+
+    def test_known_inactive_returns_disabled_ok(self):
+        code, res, calls = self._run([(True, self._st("ENDED"))], (200, {}))
+        self.assertEqual(code, self.OK)
+        self.assertEqual(res["result"], "DISABLED")
+        self.assertEqual(calls["claim"], 0)
+
+    def test_unknown_status_fails_loudly_not_disabled(self):
+        # 核心防回归：API 改版后的未知状态必须 FAIL，不得 exit0/DISABLED
+        code, res, calls = self._run([(True, self._st("SOMETHING_NEW"))], (200, {}))
+        self.assertEqual(code, self.FAIL)
+        self.assertNotIn(res["result"], ("OK", "DISABLED", "ALREADY"))
+        self.assertEqual(calls["claim"], 0)
+
+    def test_claimable_explicit_success_no_reverify(self):
+        code, res, calls = self._run(
+            [(True, self._st("CLAIMABLE"))],
+            (200, {"success": True, "rewardCredits": 100}))
+        self.assertEqual(code, self.OK)
+        self.assertEqual(res["result"], "OK")
+        self.assertEqual(res["reward_credits"], 100)
+        self.assertEqual(calls["status"], 1)          # 有显式证据→不复查
+
+    def test_claimable_ambiguous_triggers_reverify_confirms(self):
+        # 200 但无显式成功证据 → 复查 status，已 claimed 才算 OK
+        code, res, calls = self._run(
+            [(True, self._st("CLAIMABLE")), (True, self._st("CLAIMED"))],
+            (200, {}))
+        self.assertEqual(code, self.OK)
+        self.assertEqual(res["result"], "OK")
+        self.assertTrue(res.get("verified"))
+        self.assertEqual(calls["status"], 2)
+
+    def test_claimable_ambiguous_reverify_still_claimable_fails(self):
+        code, res, calls = self._run(
+            [(True, self._st("CLAIMABLE")), (True, self._st("CLAIMABLE"))],
+            (200, {}))
+        self.assertEqual(code, self.FAIL)
+        self.assertEqual(calls["status"], 2)
+
+    def test_claim_409_normalized_to_already(self):
+        code, res, _ = self._run(
+            [(True, self._st("CLAIMABLE"))], (409, {"error": "ALREADY_CLAIMED"}))
+        self.assertEqual(code, self.OK)
+        self.assertEqual(res["result"], "ALREADY")
+
+    def test_status_http_error_is_fail(self):
+        code, res, _ = self._run([(False, "HTTP 503 boom")], (200, {}))
+        self.assertEqual(code, self.FAIL)
+        self.assertEqual(res["result"], "STATUS_FAIL")
+
+
+class TestQoderStatusEnvelope(unittest.TestCase):
+    """checkin_status 必须兼容顶层 JSON 与 {data:{...}} 信封两种结构。"""
+
+    def test_unwraps_data_envelope(self):
+        with mock.patch.object(qoder_checkin, "_api",
+                               lambda *a, **k: (200, {"data": {
+                                   "status": "CLAIMED", "rewardCredits": 100,
+                                   "currentStreakDays": 5}})):
+            ok, st = qoder_checkin.checkin_status("dt-x", "uid1")
+        self.assertTrue(ok)
+        self.assertEqual(st["status"], "CLAIMED")
+        self.assertTrue(st["claimed"])
+        self.assertEqual(st["streak_days"], 5)
+
+    def test_top_level_still_works(self):
+        with mock.patch.object(qoder_checkin, "_api",
+                               lambda *a, **k: (200, {
+                                   "status": "CLAIMABLE", "rewardCredits": 100})):
+            ok, st = qoder_checkin.checkin_status("dt-x", "uid1")
+        self.assertTrue(ok)
+        self.assertEqual(st["status"], "CLAIMABLE")
+        self.assertTrue(st["claimable"])
+
+    def test_normalize_body_rejects_non_dict(self):
+        with self.assertRaises(ValueError):
+            qoder_checkin.normalize_body("not-json")
 
 
 # ── AES 已知向量（防手写密码学回归） ──────────────────────────
@@ -350,15 +485,26 @@ class TestGbkPipeUtf8Guard(unittest.TestCase):
     通过当日"已签"状态文件构造零网络路径，无需任何真实凭据。"""
 
     def _run_under_gbk(self, extra_env=None):
-        env = {k: v for k, v in os.environ.items()
-               if not (k.startswith("TRAE_")
-                       or k in ("PYTHONUTF8", "PYTHONIOENCODING", "PLUSPLUS_TOKEN"))}
-        env["PYTHONIOENCODING"] = "gbk"
-        env.update(extra_env or {})
-        return subprocess.run(
-            [sys.executable, os.path.join(HERE, "trae", "trae_checkin.py")],
-            cwd=os.path.join(HERE, "trae"), env=env,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
+        # 把 home/APPDATA 隔离到空临时目录：否则 find_storage_json() 会探测到
+        # 本机真实 Trae 安装并加载真实账号，使"无凭据→exit1"路径不可达，
+        # 测试随机器是否装 Trae 而漂移（曾在已装机上假绿/假红）。
+        iso = tempfile.mkdtemp(prefix="trae_gbk_iso_")
+        try:
+            env = {k: v for k, v in os.environ.items()
+                   if not (k.startswith("TRAE_")
+                           or k in ("PYTHONUTF8", "PYTHONIOENCODING",
+                                    "PLUSPLUS_TOKEN"))}
+            env["PYTHONIOENCODING"] = "gbk"
+            for var in ("HOME", "USERPROFILE", "HOMEPATH", "APPDATA"):
+                env[var] = iso
+            env["HOMEDRIVE"] = (os.path.splitdrive(iso)[0] or "C:")
+            env.update(extra_env or {})
+            return subprocess.run(
+                [sys.executable, os.path.join(HERE, "trae", "trae_checkin.py")],
+                cwd=os.path.join(HERE, "trae"), env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
+        finally:
+            shutil.rmtree(iso, ignore_errors=True)
 
     def test_stdout_emoji_survives_gbk_pipe(self):
         # D1 原始崩溃点：log_title/☑️/✅ 摘要全走 stdout

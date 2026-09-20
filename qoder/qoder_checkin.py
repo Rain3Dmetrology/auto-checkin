@@ -13,16 +13,19 @@
      -> AES-256-GCM 解出 {token(dt-), refreshToken(drt-), expiresAt, user{...}}
   3. dt- 过期时用 drt- 调 deviceToken/refresh 换新（结果缓存在本目录
      state.json，绝不回写 auth.v1.dat，不影响桌面客户端）
-  4. GET  /sash/api/v1/me/daily-check-in/status   今日已签则跳过
-     POST /sash/api/v1/me/daily-check-in/claim    领取签到积分
-     409 ALREADY_CLAIMED 归一化为"已签"（幂等，重复运行安全）
+  4. GET  /sash/api/v1/me/daily-check-in/status   领取窗口由服务端 status 决定
+     （活动按北京时间每日 10:00→次日 10:00 分窗，不用本地自然日判断）
+     POST /sash/api/v1/me/daily-check-in/claim    仅 CLAIMABLE 时领取
+     409 ALREADY_CLAIMED / CLAIMED 状态归一化为"已签"（幂等，重复运行安全）
+     未知 status 一律按失败上报，绝不伪装成功（防 API 改版后静默漏签）
 
 用法：
   python qoder_checkin.py            签到（已签自动跳过）
   python qoder_checkin.py status      仅查状态（调试）
   python qoder_checkin.py --json      JSON 行输出（供调度器解析）
 
-退出码：0 成功/已签/活动未开放；2 凭据缺失或解密失败；3 token 失效无法续期；4 签到失败。
+退出码：0 成功/已签/活动未开放；2 凭据缺失或解密失败；3 token 失效无法续期；
+        4 签到失败或返回未知状态（疑似 API 改版）。
 """
 
 import base64
@@ -252,14 +255,21 @@ def _parse_expires(value):
         v = int(s)
         return int(v / 1000.0) if v > 1e11 else v
     import datetime
-    for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ",
-                "%Y-%m-%dT%H:%M:%S"):
-        try:
-            return int(datetime.datetime.strptime(s[:26] if "." in s else s[:19],
-                                                  fmt).timestamp())
-        except ValueError:
-            continue
-    return 0
+    # Z 后缀 = UTC，必须按 UTC 解析；裸时间（无偏移）保持本地语义。
+    if s.endswith("Z"):
+        for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
+            try:
+                dt = datetime.datetime.strptime(
+                    s[:26] if "." in s else s[:20], fmt)
+                return int(dt.replace(tzinfo=datetime.timezone.utc).timestamp())
+            except ValueError:
+                continue
+        return 0
+    try:
+        dt = datetime.datetime.strptime(s[:19], "%Y-%m-%dT%H:%M:%S")
+        return int(dt.timestamp())
+    except ValueError:
+        return 0
 
 
 def load_app_auth():
@@ -428,70 +438,111 @@ def _api(path, method, token, uid, body=None, timeout=20):
     raise last_err or RuntimeError("request failed")
 
 
-def _today():
-    return time.strftime("%Y-%m-%d")
+# 领取窗口由服务端 status 决定（活动按 10:00→次日10:00 分窗，不是本地自然日）。
+# 兼容已领取状态的多种枚举名，避免服务端小改动击穿自动化。
+CLAIMED_STATUSES = {"CLAIMED", "CLAIMED_TODAY"}
+CLAIMABLE_STATUSES = {"CLAIMABLE"}
+KNOWN_INACTIVE_STATUSES = {"NOT_STARTED", "INACTIVE", "ENDED", "DISABLED"}
+
+
+def normalize_body(body):
+    """兼容顶层 JSON 与 {data:{...}} 信封两种响应结构。"""
+    if not isinstance(body, dict):
+        raise ValueError("unexpected non-JSON response: %r" % (body,))
+    data = body.get("data")
+    return data if isinstance(data, dict) else body
 
 
 def checkin_status(token, uid):
     status, body = _api(PATH_STATUS, "GET", token, uid)
     if status >= 400:
         return False, "HTTP %d %s" % (status, str(body)[:160])
-    last = 0
-    if body.get("lastClaimedAt"):
-        try:
-            last = int(body["lastClaimedAt"])
-        except Exception:
-            last = 0
-    st = str(body.get("status") or "")
+    try:
+        b = normalize_body(body)
+    except ValueError as exc:
+        return False, str(exc)[:160]
+    st = str(b.get("status") or "")
     return True, {
         "status": st,
-        "active": st in ("CLAIMABLE", "CLAIMED"),
-        "today_checked_in": st == "CLAIMED"
-        and last and time.strftime("%Y-%m-%d", time.localtime(last)) == _today(),
-        "streak_days": int(body.get("currentStreakDays") or 0),
-        "total_claim_days": int(body.get("totalClaimDays") or 0),
-        "reward_credits": int(body.get("rewardCredits") or 0),
-        "total_reward_credits": int(body.get("totalRewardCredits") or 0),
+        "claimed": st in CLAIMED_STATUSES,
+        "claimable": st in CLAIMABLE_STATUSES,
+        "inactive": st in KNOWN_INACTIVE_STATUSES,
+        "streak_days": int(b.get("currentStreakDays") or 0),
+        "total_claim_days": int(b.get("totalClaimDays") or 0),
+        "reward_credits": int(b.get("rewardCredits") or 0),
+        "total_reward_credits": int(b.get("totalRewardCredits") or 0),
     }
 
 
+def _claim_succeeded(body):
+    """只有拿到明确成功证据才算成功；否则返回 False 触发复查。"""
+    if not isinstance(body, dict):
+        return False, 0
+    try:
+        b = normalize_body(body)
+    except ValueError:
+        return False, 0
+    try:
+        reward = int(b.get("rewardCredits") or 0)
+    except Exception:
+        reward = 0
+    explicit = (b.get("success") is True
+                or str(b.get("result") or "").upper() in CLAIMED_STATUSES
+                or reward > 0)
+    return explicit, reward
+
+
 def do_checkin(token, uid):
-    """签到主流程：已签跳过，CLAIMABLE 才领取。返回 (exit_code, result_dict)。"""
+    """签到主流程：服务端 status 驱动。返回 (exit_code, result_dict)。
+
+    CLAIMED*  -> ALREADY（当前窗口已领，不再 POST）
+    CLAIMABLE -> POST claim；缺显式成功证据时复查一次 status 确认
+    已知 inactive -> DISABLED（exit 0，活动确实未开放）
+    未知 status   -> FAIL（exit 4）——绝不伪装成功，防 API 改版后静默漏签
+    """
     ok, st = checkin_status(token, uid)
     if not ok:
         return EXIT_FAIL, {"result": "STATUS_FAIL", "error": st}
-    if st["today_checked_in"]:
-        return EXIT_OK, {"result": "ALREADY", "msg": "今日已签到",
+
+    if st["claimed"]:
+        return EXIT_OK, {"result": "ALREADY", "msg": "当前窗口已签到",
                          "streak_days": st["streak_days"],
                          "reward_credits": st["reward_credits"]}
-    if not st["active"]:
+
+    if st["inactive"]:
         return EXIT_OK, {"result": "DISABLED",
                          "msg": "官方签到活动未开放 (status=%s)" % st["status"]}
+
+    if not st["claimable"]:
+        # 未知/新增状态：失败而非假绿，让 health 连续失败计数暴露问题
+        return EXIT_FAIL, {"result": "UNKNOWN_STATUS",
+                           "error": "未识别的签到状态 status=%r（疑似 API 改版）"
+                                    % st["status"]}
+
     status, body = _api(PATH_CLAIM, "POST", token, uid, body=b"{}")
     text = str(body)
     if status == 409 or "ALREADY_CLAIMED" in text:
-        return EXIT_OK, {"result": "ALREADY", "msg": "今日已签到",
+        return EXIT_OK, {"result": "ALREADY", "msg": "当前窗口已签到",
                          "streak_days": st["streak_days"]}
     if status >= 400:
         return EXIT_FAIL, {"result": "CLAIM_FAIL",
                            "error": "HTTP %d %s" % (status, text[:160])}
-    if isinstance(body, dict) and body.get("success") is False:
-        # 复查一次：上游可能已记账
-        ok2, st2 = checkin_status(token, uid)
-        if ok2 and st2["today_checked_in"]:
-            return EXIT_OK, {"result": "ALREADY", "msg": "今日已签到（复查确认）",
-                             "streak_days": st2["streak_days"]}
-        return EXIT_FAIL, {"result": "CLAIM_FAIL",
-                           "error": str(body.get("error") or body)[:160]}
-    reward = 0
-    if isinstance(body, dict):
-        try:
-            reward = int(body.get("rewardCredits") or 0)
-        except Exception:
-            reward = 0
-    return EXIT_OK, {"result": "OK", "msg": "签到成功 +%d 积分" % reward,
-                     "reward_credits": reward,
-                     "streak_days": None}
+
+    explicit, reward = _claim_succeeded(body)
+    if explicit:
+        return EXIT_OK, {"result": "OK", "msg": "签到成功 +%d 积分" % reward,
+                         "reward_credits": reward, "verified": False}
+
+    # 无明确成功证据：复查一次 status，已 claimed 才算成功（消灭"假成功"）
+    ok2, st2 = checkin_status(token, uid)
+    if ok2 and st2["claimed"]:
+        return EXIT_OK, {"result": "OK", "msg": "签到成功（复查确认）",
+                         "reward_credits": st2["reward_credits"] or reward,
+                         "verified": True, "status_after": st2["status"],
+                         "streak_days": st2["streak_days"]}
+    return EXIT_FAIL, {"result": "CLAIM_FAIL",
+                       "error": "claim 无明确成功证据且复查仍未领取 (resp=%s)"
+                                % text[:120]}
 
 
 def log_line(entry):
