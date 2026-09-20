@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+
+# 运行时产物：凭据缓存 / 日志 / 状态文件（含有效 token，禁止提交）
+logs/
+*.log
+qoder/state.json
+trae/.trae_checkin_state.json
+trae/.trae_token_cache.json
