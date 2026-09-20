@@ -197,7 +197,7 @@ def dc_device_id(storage):
 
 
 def find_storage_json():
-    "“”自动探测桌面端 storage.json 路径（Windows / macOS / Linux），找不到返回 None。“”"
+    """自动探测桌面端 storage.json 路径（Windows / macOS / Linux），找不到返回 None。"""
     home = os.path.expanduser('~')
     names = ('Trae CN', 'TRAE SOLO CN', 'TRAE SOLO', 'Trae')
     sub = ('User', 'globalStorage', 'storage.json')
@@ -614,6 +614,10 @@ def pick_batch(pending):
         return pending          # 默认一轮全签，9074 自动换号兜底
     if pending and in_peak_hour():
         return pending        # 早窗容量最松，一轮把剩下的全签掉（账号间照常错峰）
+    try:
+        size = max(1, int(raw))
+    except ValueError:
+        return pending          # 非法值兜底为一轮全签，绝不能让整轮签到直接崩掉
     start = bj_now().tm_hour % max(1, len(pending))
     return (pending[start:] + pending[:start])[:size]
 
@@ -988,6 +992,26 @@ def _fmt(v):
         return str(v)
 
 
+def summarize_results(results):
+    """汇总结果并给出进程退出码契约（run_all.py 依赖它做失败分类）。
+
+    退出码：
+      0 = 全部达成或设计内状态（成功 / 已签 / 待重试限流 / 未开放）
+      1 = 存在硬失败（失败 / 异常）或需人工处理（鉴权失败）
+    软限流（9074 待重试）不算失败：已记冷却，下轮计划任务自动补签。
+    "未开放"（enable=false）是服务端常态且当日已去重，同样不算失败。
+    """
+    ok_n = sum(1 for r in results if r['status'] == '签到成功')
+    already_n = sum(1 for r in results if r['status'] == '已签到')
+    soft_n = sum(1 for r in results if r['status'] in SOFT)
+    dead_n = sum(1 for r in results if r['status'] in DEAD)
+    fail_n = len(results) - ok_n - already_n - soft_n - dead_n
+    needs_human = sum(1 for r in results if r['status'] == '鉴权失败')
+    return {'ok': ok_n, 'already': already_n, 'soft': soft_n,
+            'dead': dead_n, 'fail': fail_n,
+            'exit': 1 if (fail_n + needs_human) else 0}
+
+
 # ══════════════════ 主流程 ══════════════════
 SOFT = ('待重试',)               # 限流类，冷却到点由 cron 补签，不算失败
 DEAD = ('未开放', '鉴权失败')      # 需要人工处理
@@ -1066,11 +1090,9 @@ def main():
             results.append({'name': acc.get('_name', '?'), 'uid': acc.get('uid', '-'),
                             'icon': '❌', 'status': '异常', 'credits': '-', 'detail': str(e)})
 
-    ok_n = sum(1 for r in results if r['status'] == '签到成功')
-    already_n = sum(1 for r in results if r['status'] == '已签到')
-    soft_n = sum(1 for r in results if r['status'] in SOFT)
-    dead_n = sum(1 for r in results if r['status'] in DEAD)
-    fail_n = len(results) - ok_n - already_n - soft_n - dead_n
+    st = summarize_results(results)
+    ok_n, already_n, soft_n = st['ok'], st['already'], st['soft']
+    dead_n, fail_n = st['dead'], st['fail']
 
     log_box(['✅ 成功 %d  ☑️ 已签 %d  ⏳ 待重试 %d  ❌ 失败 %d' % (ok_n, already_n, soft_n, fail_n + dead_n),
              '🕒 结束时间: %s' % bj()], '🏁 Trae SOLO 签到完成')
@@ -1079,7 +1101,12 @@ def main():
            '✅ 成功 %d  ☑️ 已签 %d  ⏳ 待重试 %d  ❌ 失败 %d' % (ok_n, already_n, soft_n, fail_n + dead_n)]
     for r in results:
         out.append('%s %s(%s): %s | %s' % (r['icon'], r['name'], r['uid'], r['status'], r['detail']))
+    # 摘要同步打到 stdout：run_all.py 按这里的"鉴权失败"等关键词做失败分类
+    # 与失败全量落盘，stdout 空洞时调度器将无从判断失败原因。
+    for line in out:
+        print(line)
     push('🤖 Trae SOLO 多账号签到', '\n'.join(out))
+    sys.exit(st['exit'])
 
 
 if __name__ == '__main__':
