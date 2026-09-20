@@ -486,7 +486,7 @@ def task_trae(poll=None):
         env["TRAE_NAME"] = cred["nickname"]
     log("trae 凭据已解出（账号 %s，来源 %s）"
         % (cred.get("nickname") or cred.get("uid") or "?",
-           os.path.basename(os.path.dirname(os.path.dirname(cred["path"]))))
+           os.path.basename(os.path.dirname(os.path.dirname(cred["path"])))))
     code, out = run_child("trae", script, [], env_extra=env)
     # trae_checkin.py：0=成功/已签/待重试限流/未开放；1=硬失败或鉴权失败
     return _finish_task("trae", code, out), None
