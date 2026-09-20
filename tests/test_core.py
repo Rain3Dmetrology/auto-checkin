@@ -178,11 +178,17 @@ class TestClassifyOutcome(unittest.TestCase):
             "qoder", 4, '{"result": "CLAIM_FAIL", "error": "HTTP 503"}'),
             run_all.OUTCOME_RETRY)
 
-    def test_qoder_not_claimed_needs_human(self):
-        # fail-close：DISABLED/ENDED/未知状态 -> NOT_CLAIMED(exit4)，重试无意义，
-        # 归 NEEDS_HUMAN 让 check.py 立即暴露（而非无限 RETRY 拖延）。
+    def test_qoder_no_campaign_retry(self):
+        # campaigns 里暂时没有每日 100 活动：多为未到 10:00 窗口/传播延迟，
+        # 归 RETRY 让后续 12:37/19:07/22:37 档兜底；连续多次仍无由 health 计数暴露。
         self.assertEqual(run_all.classify_outcome(
-            "qoder", 4, '{"result": "NOT_CLAIMED", "error": "签到状态=DISABLED"}'),
+            "qoder", 4, '{"result": "NO_CAMPAIGN", "error": "未找到目标活动"}'),
+            run_all.OUTCOME_RETRY)
+
+    def test_qoder_schema_fail_needs_human(self):
+        # 响应结构异常/未知 claimStatus = 疑似 API 改版，重试无意义，立即暴露排查。
+        self.assertEqual(run_all.classify_outcome(
+            "qoder", 4, '{"result": "SCHEMA_FAIL", "error": "claimStatus=WEIRD"}'),
             run_all.OUTCOME_HUMAN)
 
     def test_unknown_task_retry(self):
@@ -294,140 +300,265 @@ class TestParseExpires(unittest.TestCase):
         self.assertEqual(qoder_checkin._parse_expires(None), 0)
 
 
-# ── Qoder：签到状态机（服务端驱动，未知状态绝不假绿） ──────────
-class TestQoderStateMachine(unittest.TestCase):
-    """契约：领取窗口由服务端 status 决定，不用本地自然日；
-    CLAIMED*→已领(exit0)；CLAIMABLE→领取；
-    其余一切状态（DISABLED/ENDED/NOT_STARTED/未知）→FAIL(exit4)，
-    绝不伪装成功——本任务目标是"真的领到 100"，未领取必须暴露而非静默绿。
-    claim 仅在缺少显式成功证据时才复查一次 status（按需，不无条件双发）。"""
+# ── Qoder：campaigns 协议（daily-check-in 已退役） ──────────────
+# 真实抓取（2026-09-21，只读 GET /sash/api/v1/me/campaigns）确认：
+#   - 旧 daily-check-in 端点已退役，服务端只回 legacy DISABLED；
+#   - 必须带 Cosy-ClientType:10 头，否则 campaigns 返回空数组；
+#   - 同账号同时存在多个 CLAIM_BENEFIT 活动（每日 100 + 一次性致歉 500），
+#     必须按 amount==100 严格过滤，否则会领错。
+DAILY_100 = {
+    "campaignId": "01a0bb11-5645-728e-9a10-cc86e7678e1a",
+    "campaignKey": "act-20260920-044", "actionType": "CLAIM_BENEFIT",
+    "startAt": 1789869600, "endAt": 1789955940, "claimStatus": "CLAIMED",
+    "benefit": {"kind": "CREDITS", "amount": 100,
+                "modelScope": {"modelSeries": {"key": "ALL_MODELS"}},
+                "validity": {"mode": "RELATIVE_DAYS", "days": 30}},
+}
+APOLOGY_500 = {
+    "campaignId": "01a05bee-5bf0-7906-b53a-f50fec136fc8",
+    "campaignKey": "act-20260901-900", "actionType": "CLAIM_BENEFIT",
+    "startAt": 1788192000, "endAt": 1790783940, "claimStatus": "CLAIMED",
+    "benefit": {"kind": "CREDITS", "amount": 500,
+                "modelScope": {"modelSeries": {"key": "ALL_MODELS"}},
+                "validity": {"mode": "FIXED_END", "fixedEnd": "2026-09-30T15:59:00Z"}},
+}
+VIEW_ONLY = {
+    "campaignId": "01a05bbf-5668-7031-83d6-91545f97ec05",
+    "campaignKey": "act-20260901-922", "actionType": "VIEW_DETAILS",
+    "startAt": 1788243600, "endAt": 1790783940, "claimStatus": "CLAIMED",
+}
 
-    OK, FAIL = qoder_checkin.EXIT_OK, qoder_checkin.EXIT_FAIL
 
-    def _st(self, status, **extra):
-        base = {"status": status,
-                "claimed": status in qoder_checkin.CLAIMED_STATUSES,
-                "claimable": status in qoder_checkin.CLAIMABLE_STATUSES,
-                "streak_days": 3, "total_claim_days": 3,
-                "reward_credits": 100, "total_reward_credits": 300}
-        base.update(extra)
-        return base
+def _camp(claim_status, amount=100, action_type="CLAIM_BENEFIT",
+          kind="CREDITS", series="ALL_MODELS", cid="cid-daily",
+          key="act-daily", start=1789869600):
+    c = {"campaignId": cid, "campaignKey": key, "actionType": action_type,
+         "claimStatus": claim_status, "startAt": start}
+    if kind is not None:
+        c["benefit"] = {"kind": kind, "amount": amount,
+                        "modelScope": {"modelSeries": {"key": series}}}
+    return c
 
-    def _run(self, status_seq, claim_resp):
-        """status_seq: checkin_status 依次返回的 (ok, st)；claim_resp: _api 返回。"""
-        calls = {"status": 0, "claim": 0}
 
-        def fake_status(token, uid):
-            i = min(calls["status"], len(status_seq) - 1)
-            calls["status"] += 1
-            return status_seq[i]
+class TestFindTargetCampaign(unittest.TestCase):
+    """严格过滤：只认 CLAIM_BENEFIT + CREDITS + amount==100 + ALL_MODELS。"""
+
+    def test_selects_daily_100_from_real_payload(self):
+        target = qoder_checkin.find_target_campaign(
+            [VIEW_ONLY, APOLOGY_500, DAILY_100])
+        self.assertIsNotNone(target)
+        self.assertEqual(target["campaignId"], DAILY_100["campaignId"])
+
+    def test_ignores_500_apology_and_view_only(self):
+        # 只有致歉 500 包与 VIEW_DETAILS：没有每日 100 目标
+        self.assertIsNone(
+            qoder_checkin.find_target_campaign([VIEW_ONLY, APOLOGY_500]))
+
+    def test_empty_list_returns_none(self):
+        self.assertIsNone(qoder_checkin.find_target_campaign([]))
+
+    def test_prefers_claimable_over_claimed(self):
+        claimed = _camp("CLAIMED", cid="c-claimed", start=100)
+        claimable = _camp("CLAIMABLE", cid="c-claimable", start=200)
+        target = qoder_checkin.find_target_campaign([claimed, claimable])
+        self.assertEqual(target["campaignId"], "c-claimable")
+
+    def test_amount_100_required(self):
+        self.assertIsNone(qoder_checkin.find_target_campaign(
+            [_camp("CLAIMABLE", amount=200)]))
+
+    def test_non_credit_kind_rejected(self):
+        self.assertIsNone(qoder_checkin.find_target_campaign(
+            [_camp("CLAIMABLE", kind="GIFT_CARD")]))
+
+    def test_view_details_action_rejected(self):
+        self.assertIsNone(qoder_checkin.find_target_campaign(
+            [_camp("CLAIMABLE", action_type="VIEW_DETAILS", kind=None)]))
+
+
+class TestCampaignHeaders(unittest.TestCase):
+    """发现的关键 gate：缺 Cosy-ClientType 时服务端返回空 campaigns。"""
+
+    def test_headers_include_cosy_clienttype(self):
+        h = qoder_checkin._headers("dt-token", "uid1")
+        self.assertEqual(h.get("Cosy-ClientType"), "10")
+        self.assertEqual(h["Authorization"], "Bearer dt-token")
+
+    def test_headers_include_cosy_version_and_ua(self):
+        h = qoder_checkin._headers("dt-token", "uid1")
+        self.assertTrue(h.get("Cosy-Version"))
+        self.assertEqual(h.get("User-Agent"), "Qoder")
+
+
+class TestRetiredEndpointGuard(unittest.TestCase):
+    """回归守卫（对齐 caigee/cli2api 的断言）：源码绝不退回 daily-check-in。"""
+
+    def test_source_has_no_daily_check_in(self):
+        src = os.path.join(HERE, "qoder", "qoder_checkin.py")
+        with open(src, encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertNotIn("daily-check-in", text)
+
+    def test_campaigns_path_constant(self):
+        self.assertEqual(qoder_checkin.PATH_CAMPAIGNS,
+                         "/sash/api/v1/me/campaigns")
+
+    def test_claim_path_builder(self):
+        self.assertEqual(qoder_checkin.claim_path("abc-123"),
+                         "/sash/api/v1/me/campaigns/abc-123/claim")
+
+
+class TestFetchCampaigns(unittest.TestCase):
+    """fetch_campaigns -> (state, payload)；state ∈ OK/AUTH/HTTP/SCHEMA。"""
+
+    def _fetch(self, api_ret):
+        with mock.patch.object(qoder_checkin, "_api", lambda *a, **k: api_ret):
+            return qoder_checkin.fetch_campaigns("dt-x", "uid1")
+
+    def test_top_level_campaigns(self):
+        state, payload = self._fetch(
+            (200, {"showCampaign": True, "claimable": False,
+                   "campaignUrl": "u", "campaigns": [DAILY_100]}))
+        self.assertEqual(state, "OK")
+        self.assertEqual(len(payload["campaigns"]), 1)
+
+    def test_unwraps_data_envelope(self):
+        state, payload = self._fetch(
+            (200, {"data": {"campaigns": [DAILY_100]}}))
+        self.assertEqual(state, "OK")
+        self.assertEqual(payload["campaigns"][0]["campaignId"],
+                         DAILY_100["campaignId"])
+
+    def test_401_is_auth_state(self):
+        state, _ = self._fetch((401, {"error": "unauthorized"}))
+        self.assertEqual(state, "AUTH")
+
+    def test_500_is_http_state(self):
+        state, _ = self._fetch((503, "boom"))
+        self.assertEqual(state, "HTTP")
+
+    def test_missing_campaigns_field_is_schema(self):
+        state, _ = self._fetch((200, {"showCampaign": True}))
+        self.assertEqual(state, "SCHEMA")
+
+    def test_non_dict_is_schema(self):
+        state, _ = self._fetch((200, "not-json"))
+        self.assertEqual(state, "SCHEMA")
+
+
+class TestQoderCampaignFlow(unittest.TestCase):
+    """do_checkin 状态机（campaigns 驱动，fail-close 不变量保留）。"""
+
+    OK, FAIL, TOKEN = (qoder_checkin.EXIT_OK, qoder_checkin.EXIT_FAIL,
+                       qoder_checkin.EXIT_TOKEN)
+
+    def _ok(self, campaigns):
+        return ("OK", {"showCampaign": True, "claimable": True,
+                       "campaignUrl": "u", "campaigns": campaigns})
+
+    def _run(self, fetch_seq, claim_resp):
+        calls = {"fetch": 0, "claim": 0}
+
+        def fake_fetch(token, uid):
+            i = min(calls["fetch"], len(fetch_seq) - 1)
+            calls["fetch"] += 1
+            return fetch_seq[i]
 
         def fake_api(path, method, token, uid, body=None, timeout=20):
-            calls["claim"] += 1
+            if method == "POST":
+                calls["claim"] += 1
+                self.assertIn("/claim", path)
             return claim_resp
 
-        with mock.patch.object(qoder_checkin, "checkin_status", fake_status), \
+        with mock.patch.object(qoder_checkin, "fetch_campaigns", fake_fetch), \
                 mock.patch.object(qoder_checkin, "_api", fake_api):
             code, result = qoder_checkin.do_checkin("dt-x", "uid1")
         return code, result, calls
 
     def test_claimed_returns_already_without_posting(self):
-        code, res, calls = self._run([(True, self._st("CLAIMED"))], (200, {}))
+        code, res, calls = self._run(
+            [self._ok([_camp("CLAIMED")])], (200, {}))
         self.assertEqual(code, self.OK)
         self.assertEqual(res["result"], "ALREADY")
-        self.assertEqual(calls["claim"], 0)          # 已领绝不再 POST
-
-    def test_claimed_today_alias_returns_already(self):
-        code, res, _ = self._run([(True, self._st("CLAIMED_TODAY"))], (200, {}))
-        self.assertEqual(code, self.OK)
-        self.assertEqual(res["result"], "ALREADY")
-
-    def test_disabled_fails_close_not_green(self):
-        # 核心防回归：live 曾返回 status=DISABLED 却与 GUI"已领取"矛盾，
-        # 未解释清楚前绝不能当成功；DISABLED 必须 fail-close 暴露问题。
-        code, res, calls = self._run([(True, self._st("DISABLED"))], (200, {}))
-        self.assertEqual(code, self.FAIL)
-        self.assertNotIn(res["result"], ("OK", "ALREADY", "DISABLED"))
-        self.assertEqual(calls["claim"], 0)
-
-    def test_ended_fails_close_not_green(self):
-        # 活动若真结束，应让 automation 报出来（任务已失去意义），而非每天假绿
-        code, res, calls = self._run([(True, self._st("ENDED"))], (200, {}))
-        self.assertEqual(code, self.FAIL)
-        self.assertNotIn(res["result"], ("OK", "ALREADY", "DISABLED"))
-        self.assertEqual(calls["claim"], 0)
-
-    def test_unknown_status_fails_loudly_not_disabled(self):
-        # 核心防回归：API 改版后的未知状态必须 FAIL，不得 exit0/DISABLED
-        code, res, calls = self._run([(True, self._st("SOMETHING_NEW"))], (200, {}))
-        self.assertEqual(code, self.FAIL)
-        self.assertNotIn(res["result"], ("OK", "DISABLED", "ALREADY"))
         self.assertEqual(calls["claim"], 0)
 
     def test_claimable_explicit_success_no_reverify(self):
         code, res, calls = self._run(
-            [(True, self._st("CLAIMABLE"))],
-            (200, {"success": True, "rewardCredits": 100}))
+            [self._ok([_camp("CLAIMABLE")])], (200, {"success": True}))
         self.assertEqual(code, self.OK)
         self.assertEqual(res["result"], "OK")
-        self.assertEqual(res["reward_credits"], 100)
-        self.assertEqual(calls["status"], 1)          # 有显式证据→不复查
+        self.assertFalse(res.get("verified"))
+        self.assertEqual(calls["fetch"], 1)
 
-    def test_claimable_ambiguous_triggers_reverify_confirms(self):
-        # 200 但无显式成功证据 → 复查 status，已 claimed 才算 OK
+    def test_claimable_ambiguous_reverify_confirms(self):
         code, res, calls = self._run(
-            [(True, self._st("CLAIMABLE")), (True, self._st("CLAIMED"))],
+            [self._ok([_camp("CLAIMABLE")]), self._ok([_camp("CLAIMED")])],
             (200, {}))
         self.assertEqual(code, self.OK)
         self.assertEqual(res["result"], "OK")
         self.assertTrue(res.get("verified"))
-        self.assertEqual(calls["status"], 2)
+        self.assertEqual(calls["fetch"], 2)
 
     def test_claimable_ambiguous_reverify_still_claimable_fails(self):
         code, res, calls = self._run(
-            [(True, self._st("CLAIMABLE")), (True, self._st("CLAIMABLE"))],
+            [self._ok([_camp("CLAIMABLE")]), self._ok([_camp("CLAIMABLE")])],
             (200, {}))
         self.assertEqual(code, self.FAIL)
-        self.assertEqual(calls["status"], 2)
+        self.assertEqual(res["result"], "CLAIM_FAIL")
+        self.assertEqual(calls["fetch"], 2)
+
+    def test_picks_daily_100_not_apology_500(self):
+        # 同时有可领的 500 致歉包和 100 每日：必须 POST 100 的 campaignId
+        daily = _camp("CLAIMABLE", amount=100, cid="cid-daily")
+        apology = _camp("CLAIMABLE", amount=500, cid="cid-apology")
+        code, res, _ = self._run(
+            [self._ok([apology, daily])], (200, {"success": True}))
+        self.assertEqual(code, self.OK)
+        self.assertEqual(res["campaign_id"], "cid-daily")
+
+    def test_no_target_campaign_is_retryable_fail(self):
+        code, res, calls = self._run([self._ok([])], (200, {}))
+        self.assertEqual(code, self.FAIL)
+        self.assertEqual(res["result"], "NO_CAMPAIGN")
+        self.assertEqual(calls["claim"], 0)
+
+    def test_only_apology_500_is_no_campaign(self):
+        code, res, _ = self._run([self._ok([APOLOGY_500, VIEW_ONLY])], (200, {}))
+        self.assertEqual(code, self.FAIL)
+        self.assertEqual(res["result"], "NO_CAMPAIGN")
+
+    def test_unknown_claim_status_fails_close(self):
+        code, res, calls = self._run([self._ok([_camp("EXPIRED")])], (200, {}))
+        self.assertEqual(code, self.FAIL)
+        self.assertEqual(res["result"], "SCHEMA_FAIL")
+        self.assertEqual(calls["claim"], 0)
 
     def test_claim_409_normalized_to_already(self):
         code, res, _ = self._run(
-            [(True, self._st("CLAIMABLE"))], (409, {"error": "ALREADY_CLAIMED"}))
+            [self._ok([_camp("CLAIMABLE")])], (409, {"error": "ALREADY_CLAIMED"}))
         self.assertEqual(code, self.OK)
         self.assertEqual(res["result"], "ALREADY")
 
-    def test_status_http_error_is_fail(self):
-        code, res, _ = self._run([(False, "HTTP 503 boom")], (200, {}))
+    def test_claim_http_error_is_retryable_fail(self):
+        code, res, _ = self._run(
+            [self._ok([_camp("CLAIMABLE")])], (503, "boom"))
         self.assertEqual(code, self.FAIL)
-        self.assertEqual(res["result"], "STATUS_FAIL")
+        self.assertEqual(res["result"], "CLAIM_FAIL")
 
+    def test_campaigns_auth_error_maps_to_token_exit(self):
+        code, res, _ = self._run([("AUTH", None)], (200, {}))
+        self.assertEqual(code, self.TOKEN)
+        self.assertEqual(res["result"], "AUTH_FAIL")
 
-class TestQoderStatusEnvelope(unittest.TestCase):
-    """checkin_status 必须兼容顶层 JSON 与 {data:{...}} 信封两种结构。"""
+    def test_campaigns_http_error_is_fail(self):
+        code, res, _ = self._run([("HTTP", "HTTP 503 boom")], (200, {}))
+        self.assertEqual(code, self.FAIL)
+        self.assertEqual(res["result"], "CAMPAIGNS_HTTP_FAIL")
 
-    def test_unwraps_data_envelope(self):
-        with mock.patch.object(qoder_checkin, "_api",
-                               lambda *a, **k: (200, {"data": {
-                                   "status": "CLAIMED", "rewardCredits": 100,
-                                   "currentStreakDays": 5}})):
-            ok, st = qoder_checkin.checkin_status("dt-x", "uid1")
-        self.assertTrue(ok)
-        self.assertEqual(st["status"], "CLAIMED")
-        self.assertTrue(st["claimed"])
-        self.assertEqual(st["streak_days"], 5)
-
-    def test_top_level_still_works(self):
-        with mock.patch.object(qoder_checkin, "_api",
-                               lambda *a, **k: (200, {
-                                   "status": "CLAIMABLE", "rewardCredits": 100})):
-            ok, st = qoder_checkin.checkin_status("dt-x", "uid1")
-        self.assertTrue(ok)
-        self.assertEqual(st["status"], "CLAIMABLE")
-        self.assertTrue(st["claimable"])
-
-    def test_normalize_body_rejects_non_dict(self):
-        with self.assertRaises(ValueError):
-            qoder_checkin.normalize_body("not-json")
+    def test_campaigns_schema_error_is_fail(self):
+        code, res, _ = self._run([("SCHEMA", "campaigns 字段缺失")], (200, {}))
+        self.assertEqual(code, self.FAIL)
+        self.assertEqual(res["result"], "SCHEMA_FAIL")
 
 
 # ── AES 已知向量（防手写密码学回归） ──────────────────────────

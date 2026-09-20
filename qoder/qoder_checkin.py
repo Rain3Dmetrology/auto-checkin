@@ -3,7 +3,7 @@
 """Qoder CN 每日自动签到（Windows 零依赖版）。
 
 整合自两个开源实现（致谢）：
-  - hope0719/qoder-check-in   签到接口流程（sash daily-check-in）
+  - hope0719/qoder-check-in   早期签到流程（sash daily check-in，已退役）
   - luispater/qoder2api-hub   Windows 凭据解密（DPAPI + AES-256-GCM）
 
 工作原理（全程只读官方客户端凭据，不回写、不打印令牌）：
@@ -13,24 +13,33 @@
      -> AES-256-GCM 解出 {token(dt-), refreshToken(drt-), expiresAt, user{...}}
   3. dt- 过期时用 drt- 调 deviceToken/refresh 换新（结果缓存在本目录
      state.json，绝不回写 auth.v1.dat，不影响桌面客户端）
-  4. GET  /sash/api/v1/me/daily-check-in/status   领取窗口由服务端 status 决定
-     （活动按北京时间每日 10:00→次日 10:00 分窗，不用本地自然日判断）
-     POST /sash/api/v1/me/daily-check-in/claim    仅 CLAIMABLE 时领取
-     409 ALREADY_CLAIMED / CLAIMED 状态归一化为"已签"（幂等，重复运行安全）
-     未知 status 一律按失败上报，绝不伪装成功（防 API 改版后静默漏签）
+  4. GET  /sash/api/v1/me/campaigns   官方活动领取接口（每日 10:00→次日 10:00 分窗）
+     必须带 Cosy-ClientType:10 头，否则服务端返回空 campaigns（实测 2026-09-21）。
+     从返回的活动列表里严格筛出"每日 100 Credits"目标活动：
+       actionType==CLAIM_BENEFIT && benefit.kind==CREDITS
+       && benefit.amount==100 && modelScope.modelSeries.key==ALL_MODELS
+     （账号里同时可能存在一次性致歉 500 包等其它 CLAIM_BENEFIT 活动，必须按
+       amount==100 过滤，否则会领错；campaignKey 形如 act-YYYYMMDD-NNN 每日变，
+       故只能按属性动态匹配，绝不硬编码 campaignId/campaignKey。）
+     POST /sash/api/v1/me/campaigns/{campaignId}/claim   仅 claimStatus==CLAIMABLE 时领取
+     409 / ALREADY_CLAIMED 归一化为"已领"（幂等，重复运行安全）
+     claim 响应缺显式成功证据时，复查 campaigns 确认该 id 变 CLAIMED 才算成功
+     未领取（无目标活动/未知状态/请求失败）一律按失败上报，绝不伪装成功。
+
+  注：旧的 sash 每日签到端点（daily check-in 的 status/claim）已退役，服务端只回
+      legacy 活动的 DISABLED；当前桌面端 100 Credits 走上面的 campaigns 接口。
 
 用法：
-  python qoder_checkin.py            签到（已签自动跳过）
-  python qoder_checkin.py status      仅查状态（调试）
+  python qoder_checkin.py            签到（已领自动跳过）
+  python qoder_checkin.py status      仅查活动状态（调试）
   python qoder_checkin.py --json      JSON 行输出（供调度器解析）
 
-退出码：0 成功/已签；2 凭据缺失或解密失败；3 token 失效无法续期；
-        4 签到失败、活动未开放(DISABLED)或返回未知状态（一律 fail-close，
-          绝不把"未领取"伪装成成功，疑似 API 改版/资格不匹配时让失败暴露）。
+退出码：0 成功/已领；2 凭据缺失或解密失败；3 token 失效无法续期或活动接口拒绝鉴权；
+        4 领取失败、未找到目标活动或响应结构异常（一律 fail-close，
+          绝不把"未领取"伪装成成功，疑似 API 改版时让失败暴露）。
 """
 
 import base64
-import hashlib
 import hmac
 import json
 import os
@@ -46,11 +55,21 @@ import uuid
 # ---------------------------------------------------------------------------
 OPENAPI_BASE = os.environ.get("QODER_API_BASE", "https://openapi.qoder.com.cn").rstrip("/")
 GATEWAY_BASE = "https://gateway.qoder.com.cn"          # 备用基地址
-PATH_STATUS = "/sash/api/v1/me/daily-check-in/status"
-PATH_CLAIM = "/sash/api/v1/me/daily-check-in/claim"
+PATH_CAMPAIGNS = "/sash/api/v1/me/campaigns"
 PATH_DEVICE_REFRESH = "/api/v1/deviceToken/refresh"
-CLIENT_UA = "Go-http-client/2.0"
 ORIGIN = "https://qoder.com.cn"
+CLIENT_UA = "Go-http-client/2.0"   # deviceToken/refresh 沿用此 UA（已验证可用，勿动鉴权层）
+# 活动接口要求桌面端 Cosy 头；缺 Cosy-ClientType 时服务端返回空 campaigns（实测）。
+COSY_CLIENT_TYPE = "10"
+COSY_VERSION = "0.3.4"          # 2026-09-21 实测被服务端接受的客户端版本
+CAMPAIGN_UA = "Qoder"
+CAMPAIGN_REFERER = "https://openapi.qoder.com.cn/growth-page/activity-iframe"
+DAILY_BENEFIT_AMOUNT = 100      # 每日活动固定 100 Credits（用于严格区分其它活动）
+
+
+def claim_path(campaign_id):
+    """领取动作端点：POST /sash/api/v1/me/campaigns/{campaignId}/claim。"""
+    return "/sash/api/v1/me/campaigns/%s/claim" % campaign_id
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(HERE, "state.json")
@@ -385,28 +404,22 @@ def ensure_token():
 
 
 # ---------------------------------------------------------------------------
-# 签到接口
+# 活动接口
 # ---------------------------------------------------------------------------
-def _derive_id(uid, salt):
-    """由 uid 稳定派生设备/会话标识（与官方客户端多会话行为一致，防风控）。"""
-    return hashlib.md5(("%s:%s" % (salt, uid or "anonymous")).encode("utf-8")).hexdigest()[:36]
-
-
 def _headers(token, uid):
-    h = {
+    """活动接口请求头。Cosy-ClientType 是关键 gate：缺失时服务端返回空 campaigns。
+    旧 daily check-in 协议里自派的 X-Machine-ID/X-Session-ID/X-Request-ID 经实测
+    对 campaigns 接口无影响，已移除（与桌面端 activity iframe 的真实请求对齐）。"""
+    return {
         "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/json",
-        "User-Agent": CLIENT_UA,
+        "User-Agent": CAMPAIGN_UA,
         "Authorization": "Bearer " + token,
+        "Cosy-ClientType": COSY_CLIENT_TYPE,
+        "Cosy-Version": COSY_VERSION,
         "Origin": ORIGIN,
-        "Referer": ORIGIN + "/",
+        "Referer": CAMPAIGN_REFERER,
     }
-    if uid:
-        h["X-Request-ID"] = "%s-%s" % (_derive_id(uid, "req"),
-                                       str(time.time_ns() % 1000000).zfill(6))
-        h["X-Machine-ID"] = _derive_id(uid, "machine")
-        h["X-Session-ID"] = _derive_id(uid, "session")
-    return h
 
 
 def _api(path, method, token, uid, body=None, timeout=20):
@@ -439,9 +452,8 @@ def _api(path, method, token, uid, body=None, timeout=20):
     raise last_err or RuntimeError("request failed")
 
 
-# 领取窗口由服务端 status 决定（活动按 10:00→次日10:00 分窗，不是本地自然日）。
-# 兼容已领取状态的多种枚举名，避免服务端小改动击穿自动化。
-# 注意：除 CLAIMED*/CLAIMABLE 外的一切状态（含 DISABLED/ENDED/未知）一律 fail-close，
+# 领取窗口由服务端 campaigns 决定（活动按 10:00→次日10:00 分窗，不是本地自然日）。
+# 注意：除 CLAIMED/CLAIMABLE 外的一切 claimStatus（含未知枚举）一律 fail-close，
 # 不当作成功——本任务目标是"真的领到 100"，未领取必须暴露而非静默绿。
 CLAIMED_STATUSES = {"CLAIMED", "CLAIMED_TODAY"}
 CLAIMABLE_STATUSES = {"CLAIMABLE"}
@@ -455,95 +467,185 @@ def normalize_body(body):
     return data if isinstance(data, dict) else body
 
 
-def checkin_status(token, uid):
-    status, body = _api(PATH_STATUS, "GET", token, uid)
-    if status >= 400:
-        return False, "HTTP %d %s" % (status, str(body)[:160])
+def _benefit_amount(campaign):
+    b = campaign.get("benefit") or {}
     try:
-        b = normalize_body(body)
+        return int(b.get("amount") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _is_daily_100(campaign):
+    """严格判定"每日 100 Credits"目标活动，排除一次性致歉 500 包/VIEW_DETAILS 等。"""
+    if not isinstance(campaign, dict):
+        return False
+    b = campaign.get("benefit") or {}
+    if not isinstance(b, dict):
+        return False
+    series = ((b.get("modelScope") or {}).get("modelSeries") or {}).get("key")
+    return (campaign.get("actionType") == "CLAIM_BENEFIT"
+            and b.get("kind") == "CREDITS"
+            and _benefit_amount(campaign) == DAILY_BENEFIT_AMOUNT
+            and series == "ALL_MODELS")
+
+
+def find_target_campaign(campaigns):
+    """从活动列表里挑出每日 100 Credits 活动；没有则返回 None。
+    多个匹配时优先 CLAIMABLE，再按 startAt 取最新窗口。"""
+    matches = [c for c in (campaigns or []) if _is_daily_100(c)]
+    if not matches:
+        return None
+
+    def rank(c):
+        claimable = str(c.get("claimStatus") or "").upper() in CLAIMABLE_STATUSES
+        try:
+            start = int(c.get("startAt") or 0)
+        except (TypeError, ValueError):
+            start = 0
+        return (1 if claimable else 0, start)
+
+    return sorted(matches, key=rank, reverse=True)[0]
+
+
+def fetch_campaigns(token, uid):
+    """GET campaigns。返回 (state, payload)：
+      state=OK     payload 为含 campaigns 列表的 dict
+      state=AUTH   401/403，token 被拒（payload=None）
+      state=HTTP   其它 4xx/5xx 或网络错误（payload 为错误串）
+      state=SCHEMA 200 但结构异常/疑似改版（payload 为说明串）
+    """
+    try:
+        status, body = _api(PATH_CAMPAIGNS, "GET", token, uid)
+    except Exception as exc:
+        return "HTTP", "请求失败：%r" % (exc,)
+    if status in (401, 403):
+        return "AUTH", None
+    if status >= 400:
+        return "HTTP", "HTTP %d %s" % (status, str(body)[:160])
+    try:
+        data = normalize_body(body)
     except ValueError as exc:
-        return False, str(exc)[:160]
-    st = str(b.get("status") or "")
-    return True, {
-        "status": st,
-        "claimed": st in CLAIMED_STATUSES,
-        "claimable": st in CLAIMABLE_STATUSES,
-        "streak_days": int(b.get("currentStreakDays") or 0),
-        "total_claim_days": int(b.get("totalClaimDays") or 0),
-        "reward_credits": int(b.get("rewardCredits") or 0),
-        "total_reward_credits": int(b.get("totalRewardCredits") or 0),
-    }
+        return "SCHEMA", str(exc)[:160]
+    if not isinstance(data.get("campaigns"), list):
+        return "SCHEMA", "campaigns 字段缺失或非列表（疑似 API 改版）"
+    return "OK", data
 
 
 def _claim_succeeded(body):
-    """只有拿到明确成功证据才算成功；否则返回 False 触发复查。"""
+    """claim 响应里是否有明确成功证据（缺则触发复查）。返回 bool。"""
     if not isinstance(body, dict):
-        return False, 0
+        return False
     try:
         b = normalize_body(body)
     except ValueError:
-        return False, 0
+        return False
+    if b.get("success") is True:
+        return True
+    cs = str(b.get("claimStatus") or b.get("status") or "").upper()
+    if cs in CLAIMED_STATUSES:
+        return True
+    if _benefit_amount(b) > 0:
+        return True
     try:
-        reward = int(b.get("rewardCredits") or 0)
-    except Exception:
-        reward = 0
-    explicit = (b.get("success") is True
-                or str(b.get("result") or "").upper() in CLAIMED_STATUSES
-                or reward > 0)
-    return explicit, reward
+        if int(b.get("rewardCredits") or 0) > 0:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return False
 
 
 def do_checkin(token, uid):
-    """签到主流程：服务端 status 驱动。返回 (exit_code, result_dict)。
+    """签到主流程：campaigns 驱动。返回 (exit_code, result_dict)。
 
-    CLAIMED*  -> ALREADY（当前窗口已领，不再 POST）
-    CLAIMABLE -> POST claim；缺显式成功证据时复查一次 status 确认
-    其余一切（DISABLED/ENDED/NOT_STARTED/未知）-> FAIL（exit 4）
-        绝不伪装成功：目标是"真的领到 100"，未领取必须暴露而非静默绿。
+    目标活动 CLAIMED   -> ALREADY（本轮已领，不再 POST）
+    目标活动 CLAIMABLE -> POST claim；缺显式成功证据时复查 campaigns 确认 CLAIMED
+    无目标活动         -> NO_CAMPAIGN（exit4，未到窗口/传播延迟，归可重试）
+    未知 claimStatus / 结构异常 -> SCHEMA_FAIL（exit4，疑似改版，归需人工）
+    绝不伪装成功：目标是"真的领到 100"，未领取必须暴露而非静默绿。
     """
-    ok, st = checkin_status(token, uid)
-    if not ok:
-        return EXIT_FAIL, {"result": "STATUS_FAIL", "error": st}
+    state, payload = fetch_campaigns(token, uid)
+    if state == "AUTH":
+        return EXIT_TOKEN, {"result": "AUTH_FAIL",
+                            "error": "campaigns 接口拒绝鉴权(401/403)，token 可能已失效"}
+    if state == "HTTP":
+        return EXIT_FAIL, {"result": "CAMPAIGNS_HTTP_FAIL", "error": payload}
+    if state == "SCHEMA":
+        return EXIT_FAIL, {"result": "SCHEMA_FAIL", "error": payload}
 
-    if st["claimed"]:
-        return EXIT_OK, {"result": "ALREADY", "msg": "当前窗口已签到",
-                         "streak_days": st["streak_days"],
-                         "reward_credits": st["reward_credits"]}
+    campaigns = payload.get("campaigns") or []
+    target = find_target_campaign(campaigns)
+    if target is None:
+        # 未找到每日 100 活动：多为未到 10:00 窗口或活动刚开放传播延迟。归 RETRY，
+        # 让后续 12:37/19:07/22:37 档兜底；连续多次仍无由 health 计数暴露给人工。
+        return EXIT_FAIL, {"result": "NO_CAMPAIGN",
+                           "error": "campaigns 中未找到 CLAIM_BENEFIT/CREDITS/100/"
+                                    "ALL_MODELS 目标活动（共 %d 个活动）。可能未到 "
+                                    "10:00 窗口、活动已结束或响应改版。" % len(campaigns)}
 
-    if not st["claimable"]:
-        # fail-close：DISABLED/ENDED/未知状态都按失败上报，让 health 连续失败计数
-        # 暴露问题。曾观测到 live status=DISABLED 与桌面端"已领取"矛盾，未查清前
-        # 绝不当成功；活动若真结束也应报出来（任务已失去意义），而非每天假绿。
-        return EXIT_FAIL, {"result": "NOT_CLAIMED",
-                           "error": "签到状态=%r，未领取，按失败上报（不当作成功）。"
-                                    "若桌面端显示活动可领，疑似 status 接口语义/账号"
-                                    "资格与该活动不匹配，或 API 改版，需排查。"
-                                    % st["status"]}
+    cid = target.get("campaignId")
+    amount = _benefit_amount(target)
+    cstatus = str(target.get("claimStatus") or "").upper()
 
-    status, body = _api(PATH_CLAIM, "POST", token, uid, body=b"{}")
+    if cstatus in CLAIMED_STATUSES:
+        return EXIT_OK, {"result": "ALREADY", "msg": "本轮已领取 %d Credits" % amount,
+                         "reward_credits": amount, "campaign_id": cid}
+
+    if cstatus not in CLAIMABLE_STATUSES:
+        # 未知/异常 claimStatus（EXPIRED/NOT_STARTED/LOCKED/新枚举）-> fail-close
+        return EXIT_FAIL, {"result": "SCHEMA_FAIL",
+                           "error": "目标活动 claimStatus=%r 非 CLAIMED/CLAIMABLE，"
+                                    "按失败上报（疑似活动状态枚举改版）。" % cstatus}
+
+    status, body = _api(claim_path(cid), "POST", token, uid, body=b"{}")
     text = str(body)
-    if status == 409 or "ALREADY_CLAIMED" in text:
-        return EXIT_OK, {"result": "ALREADY", "msg": "当前窗口已签到",
-                         "streak_days": st["streak_days"]}
+    if status in (401, 403):
+        return EXIT_TOKEN, {"result": "AUTH_FAIL",
+                            "error": "claim 接口返回 %d，token 可能已失效" % status}
+    if status == 409 or "ALREADY_CLAIMED" in text.upper():
+        return EXIT_OK, {"result": "ALREADY", "msg": "本轮已领取（claim 返回 409）",
+                         "reward_credits": amount, "campaign_id": cid}
     if status >= 400:
         return EXIT_FAIL, {"result": "CLAIM_FAIL",
-                           "error": "HTTP %d %s" % (status, text[:160])}
+                           "error": "claim HTTP %d %s" % (status, text[:160])}
 
-    explicit, reward = _claim_succeeded(body)
-    if explicit:
-        return EXIT_OK, {"result": "OK", "msg": "签到成功 +%d 积分" % reward,
-                         "reward_credits": reward, "verified": False}
+    if _claim_succeeded(body):
+        return EXIT_OK, {"result": "OK", "msg": "领取成功 +%d Credits" % amount,
+                         "reward_credits": amount, "campaign_id": cid, "verified": False}
 
-    # 无明确成功证据：复查一次 status，已 claimed 才算成功（消灭"假成功"）
-    ok2, st2 = checkin_status(token, uid)
-    if ok2 and st2["claimed"]:
-        return EXIT_OK, {"result": "OK", "msg": "签到成功（复查确认）",
-                         "reward_credits": st2["reward_credits"] or reward,
-                         "verified": True, "status_after": st2["status"],
-                         "streak_days": st2["streak_days"]}
+    # 无明确成功证据：复查 campaigns，确认该 campaignId 变 CLAIMED 才算成功（消灭假成功）
+    state2, payload2 = fetch_campaigns(token, uid)
+    if state2 == "OK":
+        for c in (payload2.get("campaigns") or []):
+            if (isinstance(c, dict) and c.get("campaignId") == cid
+                    and str(c.get("claimStatus") or "").upper() in CLAIMED_STATUSES):
+                return EXIT_OK, {"result": "OK", "msg": "领取成功（复查确认）",
+                                 "reward_credits": amount, "campaign_id": cid,
+                                 "verified": True}
     return EXIT_FAIL, {"result": "CLAIM_FAIL",
-                       "error": "claim 无明确成功证据且复查仍未领取 (resp=%s)"
+                       "error": "claim 无明确成功证据且复查未确认 CLAIMED (resp=%s)"
                                 % text[:120]}
+
+
+def campaigns_summary(token, uid):
+    """status 子命令用：返回 (ok, 概览 dict)。"""
+    state, payload = fetch_campaigns(token, uid)
+    if state != "OK":
+        return False, {"state": state, "error": payload}
+    camps = [c for c in (payload.get("campaigns") or []) if isinstance(c, dict)]
+    target = find_target_campaign(camps)
+    return True, {
+        "show_campaign": payload.get("showCampaign"),
+        "claimable": payload.get("claimable"),
+        "n_campaigns": len(camps),
+        "campaigns": [{"campaignKey": c.get("campaignKey"),
+                       "actionType": c.get("actionType"),
+                       "claimStatus": c.get("claimStatus"),
+                       "amount": _benefit_amount(c)} for c in camps],
+        "target": ({"campaignId": target.get("campaignId"),
+                    "campaignKey": target.get("campaignKey"),
+                    "claimStatus": target.get("claimStatus"),
+                    "amount": _benefit_amount(target)} if target else None),
+    }
 
 
 def log_line(entry):
@@ -573,12 +675,13 @@ def main():
         sys.exit(EXIT_AUTH)
 
     if cmd == "status":
-        ok, st = checkin_status(token, uid)
+        ok, summary = campaigns_summary(token, uid)
         if as_json:
             log_line({"cmd": cmd, "result": "OK" if ok else "FAIL",
-                      "status": st if ok else None, "error": None if ok else st})
+                      "status": summary if ok else None,
+                      "error": None if ok else summary})
         else:
-            print(json.dumps(st if ok else {"error": st}, ensure_ascii=False, indent=2))
+            print(json.dumps(summary, ensure_ascii=False, indent=2))
         sys.exit(EXIT_OK if ok else EXIT_FAIL)
 
     code, result = do_checkin(token, uid)
@@ -588,8 +691,6 @@ def main():
     else:
         icon = {"OK": "[+]", "ALREADY": "[=]"}.get(result["result"], "[!]")
         print("%s Qoder CN: %s" % (icon, result.get("msg") or result.get("error")))
-        if result.get("streak_days") is not None:
-            print("    连签 %s 天" % result["streak_days"])
     sys.exit(code)
 
 

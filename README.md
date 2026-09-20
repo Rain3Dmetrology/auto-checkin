@@ -96,13 +96,20 @@ Get-Content logs\run_$(Get-Date -Format yyyy-MM-dd).log
 |------|------|---------|
 | OK | 成功 / 已签 / 设计内跳过（未安装、未登录） | 正常退出 |
 | RETRY | 瞬时失败（网络、超时、服务端 5xx、9074 限流） | 当前轮不重试，下一个触发点自动补签（每天 6+ 次机会，已签幂等跳过） |
-| NEEDS_HUMAN | 凭据/会话失效（重新登录才能解决）；或 Qoder 返回非可领状态（DISABLED/未知，`NOT_CLAIMED`） | 重试无意义，落盘完整输出等待人工处理 |
+| NEEDS_HUMAN | 凭据/会话失效（重新登录才能解决）；或 Qoder 活动接口响应结构异常/未知状态（疑似 API 改版，`SCHEMA_FAIL`） | 重试无意义，落盘完整输出等待人工处理 |
 
-> **Qoder fail-close 说明**：Qoder 签到只对 `CLAIMED*`/`CLAIMABLE` 判成功，其余一切状态
-> （含 `DISABLED`、`ENDED`、未知）一律按失败上报（`NOT_CLAIMED`→NEEDS_HUMAN），绝不静默
-> 判绿。因为本任务目标是"真的领到 100 Credits"，"没领到"必须暴露。若你看到 Qoder 持续
-> NEEDS_HUMAN 且状态为 DISABLED，但桌面端 GUI 显示活动可领，说明 status 接口语义/账号资格
-> 与该活动不匹配，需排查（这正是 fail-close 要暴露的情况，而非 bug）。
+> **Qoder fail-close 说明**：Qoder 走官方活动领取接口 `GET /sash/api/v1/me/campaigns`
+> （必须带 `Cosy-ClientType:10` 头，否则服务端返回空列表），从返回的活动里严格筛出
+> "每日 100 Credits"目标（`CLAIM_BENEFIT` + `CREDITS` + `amount==100` + `ALL_MODELS`，
+> 以区分账号里可能存在的一次性致歉 500 包等其它活动）。判定：目标 `CLAIMED`→已领(exit0)；
+> `CLAIMABLE`→`POST .../{campaignId}/claim` 领取，缺显式成功证据时复查 campaigns 确认变
+> `CLAIMED` 才算成功；未领取一律按失败上报，绝不静默判绿——目标是"真的领到 100"。
+> 失败分两类：`NO_CAMPAIGN`（未到 10:00 窗口/活动刚开放传播延迟）与 `CLAIM_FAIL`（瞬时
+> 网络/5xx）归 RETRY，靠后续触发点兜底；`SCHEMA_FAIL`（结构异常/未知 `claimStatus`，疑似
+> 改版）归 NEEDS_HUMAN 立即暴露。
+>
+> 历史背景：旧版脚本调的 `daily check-in` 端点已被官方退役（服务端只回 legacy 活动的
+> `DISABLED`），曾导致"GUI 显示已领取、脚本却报 DISABLED"的矛盾；现已迁移到 campaigns 接口。
 
 - 连续失败计数记在 `logs\health.json`（`consecutive_failures`），成功一次即清零。
 - 任何失败任务当轮的完整输出（不止日志摘要）写入 `logs\fail_<任务>_<时间>.txt`，用于追溯根因。
@@ -151,9 +158,9 @@ python -m unittest tests.test_core    # 零依赖：退出码契约/轮签/失�
 
 子脚本退出码契约（调度器失败分类的依据）：`run_all.py` 0 全部成功；1 存在失败项。
 `trae_checkin.py` 0 成功/已签/软限流/未开放，1 硬失败或鉴权失败；`qoder_checkin.py`
-0 成功/已签，2 凭据缺失或解密失败，3 token 失效无法续期，4 签到请求失败、活动未开放
-（DISABLED）或返回未知状态（一律 fail-close：`NOT_CLAIMED` 归需人工排查、`CLAIM_FAIL`
-归可重试，绝不静默判成功）。
+0 成功/已领，2 凭据缺失或解密失败，3 token 失效无法续期或活动接口拒绝鉴权，4 未领取
+（一律 fail-close，绝不静默判成功）——其中 `NO_CAMPAIGN`/`CLAIM_FAIL` 归可重试、
+`SCHEMA_FAIL`（疑似 API 改版）归需人工排查。
 
 ## 卸载
 
@@ -168,7 +175,8 @@ powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
 |------|------|------|
 | workbuddy\signin.py | github.com/88lin/workbuddy-auto-signin | MIT |
 | trae\trae_checkin.py | github.com/L0NE-6/Trae-AutoCheckin | 见原仓库 |
-| qoder 签到流程 | github.com/hope0719/qoder-check-in | 见原仓库 |
+| qoder 签到流程 | github.com/hope0719/qoder-check-in（旧 daily check-in，已退役） | 见原仓库 |
+| qoder campaigns 协议 | 反编译官方桌面端 app.asar 实证，并交叉参考 caigee-cmd/cli2api、techysy/10router、LeiSureLyYrsc/Qoder2OAPI | 见各原仓库 |
 | qoder Windows 解密 | qoder2api-hub（DPAPI + AES-GCM 逆向实现） | 见原仓库 |
 | run_all.py / check.py / install.ps1 | 本整合包 | MIT |
 
