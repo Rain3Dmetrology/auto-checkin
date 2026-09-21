@@ -363,6 +363,14 @@ class TestFindTargetCampaign(unittest.TestCase):
         target = qoder_checkin.find_target_campaign([claimed, claimable])
         self.assertEqual(target["campaignId"], "c-claimable")
 
+    def test_prefers_newest_window_over_older_claimable(self):
+        # 最新窗口优先：昨天残留的 CLAIMABLE 不应盖过今天（最新 startAt）的活动，
+        # 否则会去 POST 一个已过期窗口。claimable 仅作同窗口内的次级排序键。
+        older_claimable = _camp("CLAIMABLE", cid="c-old", start=100)
+        newer = _camp("CLAIMED", cid="c-new", start=200)
+        target = qoder_checkin.find_target_campaign([older_claimable, newer])
+        self.assertEqual(target["campaignId"], "c-new")
+
     def test_amount_100_required(self):
         self.assertIsNone(qoder_checkin.find_target_campaign(
             [_camp("CLAIMABLE", amount=200)]))
@@ -406,6 +414,74 @@ class TestRetiredEndpointGuard(unittest.TestCase):
     def test_claim_path_builder(self):
         self.assertEqual(qoder_checkin.claim_path("abc-123"),
                          "/sash/api/v1/me/campaigns/abc-123/claim")
+
+    def test_claim_path_escapes_id(self):
+        # campaignId 来自服务端（信任边界），含路径分隔符/空格也必须转义，
+        # 否则会拼出畸形或越界的 claim URL。
+        self.assertEqual(qoder_checkin.claim_path("a/b c"),
+                         "/sash/api/v1/me/campaigns/a%2Fb%20c/claim")
+
+
+class TestApiNoCrossHostFallback(unittest.TestCase):
+    """P0：campaigns 的 GET/POST 只走 OPENAPI_BASE，绝不跨 host fallback。
+    有副作用的 claim POST 若在网络模糊失败后自动改打第二个 host，会绕过
+    do_checkin 的复查恢复——第一枪可能已领取成功，却被第二次的 4xx 覆盖成 CLAIM_FAIL。"""
+
+    def _raiser(self, exc):
+        seen = []
+
+        def fake_urlopen(req, timeout=None):
+            seen.append(req.full_url)
+            raise exc
+        return seen, fake_urlopen
+
+    def test_post_failure_does_not_retry_second_host(self):
+        seen, fake = self._raiser(RuntimeError("connection reset"))
+        with mock.patch.object(qoder_checkin.urllib.request, "urlopen", fake):
+            with self.assertRaises(RuntimeError):
+                qoder_checkin._api(qoder_checkin.claim_path("cid-1"), "POST",
+                                   "dt-x", "uid1", body=b"{}")
+        self.assertEqual(len(seen), 1, "claim POST 失败后不得改打第二个 host")
+        self.assertTrue(seen[0].startswith(qoder_checkin.OPENAPI_BASE))
+        self.assertNotIn("gateway.qoder.com.cn", seen[0])
+
+    def test_get_campaigns_uses_single_openapi_host(self):
+        seen, fake = self._raiser(RuntimeError("timed out"))
+        with mock.patch.object(qoder_checkin.urllib.request, "urlopen", fake):
+            with self.assertRaises(RuntimeError):
+                qoder_checkin._api(qoder_checkin.PATH_CAMPAIGNS, "GET",
+                                   "dt-x", "uid1")
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(seen[0].startswith(qoder_checkin.OPENAPI_BASE))
+
+
+class TestClaimSucceededStrict(unittest.TestCase):
+    """P1：只认真正的状态证据。金额/积分字段不算成功——否则
+    {"status":"FAILED","benefit":{"amount":100}} 会被误判为已领取，违背 fail-close。"""
+
+    def test_success_true(self):
+        self.assertTrue(qoder_checkin._claim_succeeded({"success": True}))
+
+    def test_claimed_status(self):
+        self.assertTrue(qoder_checkin._claim_succeeded({"status": "CLAIMED"}))
+        self.assertTrue(qoder_checkin._claim_succeeded({"claimStatus": "CLAIMED_TODAY"}))
+
+    def test_replayed_true(self):
+        self.assertTrue(qoder_checkin._claim_succeeded({"replayed": True}))
+
+    def test_failed_with_amount_is_not_success(self):
+        self.assertFalse(qoder_checkin._claim_succeeded(
+            {"status": "FAILED", "benefit": {"amount": 100}}))
+
+    def test_amount_only_is_not_success(self):
+        self.assertFalse(qoder_checkin._claim_succeeded({"benefit": {"amount": 100}}))
+
+    def test_reward_credits_only_is_not_success(self):
+        self.assertFalse(qoder_checkin._claim_succeeded({"rewardCredits": 100}))
+
+    def test_empty_dict_not_success(self):
+        self.assertFalse(qoder_checkin._claim_succeeded({}))
+
 
 
 class TestFetchCampaigns(unittest.TestCase):
@@ -535,11 +611,40 @@ class TestQoderCampaignFlow(unittest.TestCase):
         self.assertEqual(res["result"], "SCHEMA_FAIL")
         self.assertEqual(calls["claim"], 0)
 
-    def test_claim_409_normalized_to_already(self):
-        code, res, _ = self._run(
-            [self._ok([_camp("CLAIMABLE")])], (409, {"error": "ALREADY_CLAIMED"}))
+    def test_claim_409_reverify_claimed_is_already(self):
+        # 409 不再裸判 ALREADY：复查确认该 campaignId 真变 CLAIMED 才认已领取
+        code, res, calls = self._run(
+            [self._ok([_camp("CLAIMABLE")]), self._ok([_camp("CLAIMED")])],
+            (409, {"error": "ALREADY_CLAIMED"}))
         self.assertEqual(code, self.OK)
         self.assertEqual(res["result"], "ALREADY")
+        self.assertEqual(calls["fetch"], 2)
+
+    def test_claim_409_other_conflict_still_claimable_fails(self):
+        # 409 只是 Conflict，不等价"已领取"。复查仍 CLAIMABLE -> 必须 FAIL，不得假绿
+        code, res, calls = self._run(
+            [self._ok([_camp("CLAIMABLE")]), self._ok([_camp("CLAIMABLE")])],
+            (409, {"error": "OTHER_CONFLICT"}))
+        self.assertEqual(code, self.FAIL)
+        self.assertEqual(res["result"], "CLAIM_FAIL")
+        self.assertEqual(calls["fetch"], 2)
+
+    def test_empty_campaign_id_is_schema_fail(self):
+        # campaignId 缺失/空时不得拼出 /campaigns//claim 去 POST，直接 SCHEMA_FAIL
+        code, res, calls = self._run(
+            [self._ok([_camp("CLAIMABLE", cid="")])], (200, {"success": True}))
+        self.assertEqual(code, self.FAIL)
+        self.assertEqual(res["result"], "SCHEMA_FAIL")
+        self.assertEqual(calls["claim"], 0)
+
+    def test_claim_response_amount_only_triggers_reverify(self):
+        # 2xx 但响应只有金额、无状态证据：不算成功，触发复查；复查未确认 -> FAIL
+        code, res, calls = self._run(
+            [self._ok([_camp("CLAIMABLE")]), self._ok([_camp("CLAIMABLE")])],
+            (200, {"status": "FAILED", "benefit": {"amount": 100}}))
+        self.assertEqual(code, self.FAIL)
+        self.assertEqual(res["result"], "CLAIM_FAIL")
+        self.assertEqual(calls["fetch"], 2)
 
     def test_claim_http_error_is_retryable_fail(self):
         code, res, _ = self._run(

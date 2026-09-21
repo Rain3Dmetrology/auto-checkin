@@ -47,6 +47,7 @@ import ssl
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 
@@ -70,8 +71,10 @@ DAILY_BENEFIT_AMOUNT = 100      # 每日活动固定 100 Credits（用于严格�
 
 
 def claim_path(campaign_id):
-    """领取动作端点：POST /sash/api/v1/me/campaigns/{campaignId}/claim。"""
-    return "/sash/api/v1/me/campaigns/%s/claim" % campaign_id
+    """领取动作端点：POST /sash/api/v1/me/campaigns/{campaignId}/claim。
+    campaignId 来自服务端（信任边界），用 quote(safe='') 转义防畸形/越界 URL。"""
+    return "/sash/api/v1/me/campaigns/%s/claim" % urllib.parse.quote(
+        str(campaign_id), safe="")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(HERE, "state.json")
@@ -427,33 +430,34 @@ def _headers(token, uid):
 
 
 def _api(path, method, token, uid, body=None, timeout=20):
-    """带备用基地址的请求。返回 (http_status, body_dict_or_text)。"""
-    last_err = None
-    for base in (OPENAPI_BASE, GATEWAY_BASE):
-        req = urllib.request.Request(
-            base + path, data=body, method=method,
-            headers=_headers(token, uid))
+    """活动接口请求，返回 (http_status, body_dict_or_text)。
+
+    campaigns 的 GET/POST 都**只走 OPENAPI_BASE，绝不跨 host fallback**：claim 是
+    有副作用的 POST，若第一枪服务端已领取成功但客户端超时/连接中断，自动改打第二个
+    host 会再 POST 一次并拿回 4xx，从而绕过 do_checkin 的复查恢复——把"其实已领到"
+    误判成 CLAIM_FAIL。因此网络异常一律向上抛，交给 do_checkin 复查判定。
+    （deviceToken/refresh 有自己的跨 host fallback，见 refresh_token_pair，不受影响。）"""
+    req = urllib.request.Request(
+        OPENAPI_BASE + path, data=body, method=method,
+        headers=_headers(token, uid))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+            status = resp.status if hasattr(resp, "status") else 200
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                raw = resp.read().decode("utf-8")
-            try:
-                return resp.status if hasattr(resp, "status") else 200, json.loads(raw)
-            except ValueError:
-                return 200, raw
-        except urllib.error.HTTPError as exc:
-            try:
-                raw = exc.read().decode("utf-8", "replace")
-            except Exception:
-                raw = ""
-            try:
-                parsed = json.loads(raw)
-            except ValueError:
-                parsed = raw
-            return exc.code, parsed
-        except Exception as exc:
-            last_err = exc
-            continue
-    raise last_err or RuntimeError("request failed")
+            return status, json.loads(raw)
+        except ValueError:
+            return status, raw
+    except urllib.error.HTTPError as exc:
+        try:
+            raw = exc.read().decode("utf-8", "replace")
+        except Exception:
+            raw = ""
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            parsed = raw
+        return exc.code, parsed
 
 
 # 领取窗口由服务端 campaigns 决定（活动按 10:00→次日10:00 分窗，不是本地自然日）。
@@ -495,18 +499,19 @@ def _is_daily_100(campaign):
 
 def find_target_campaign(campaigns):
     """从活动列表里挑出每日 100 Credits 活动；没有则返回 None。
-    多个匹配时优先 CLAIMABLE，再按 startAt 取最新窗口。"""
+    多个匹配时取 startAt 最新（当前窗口）的活动，claimable 仅作同窗口内的次级键——
+    避免某天残留的旧窗口 CLAIMABLE 盖过当前窗口，导致去 POST 一个已过期活动。"""
     matches = [c for c in (campaigns or []) if _is_daily_100(c)]
     if not matches:
         return None
 
     def rank(c):
-        claimable = str(c.get("claimStatus") or "").upper() in CLAIMABLE_STATUSES
         try:
             start = int(c.get("startAt") or 0)
         except (TypeError, ValueError):
             start = 0
-        return (1 if claimable else 0, start)
+        claimable = str(c.get("claimStatus") or "").upper() in CLAIMABLE_STATUSES
+        return (start, 1 if claimable else 0)
 
     return sorted(matches, key=rank, reverse=True)[0]
 
@@ -536,7 +541,10 @@ def fetch_campaigns(token, uid):
 
 
 def _claim_succeeded(body):
-    """claim 响应里是否有明确成功证据（缺则触发复查）。返回 bool。"""
+    """claim 响应里是否有**明确状态证据**（缺则触发复查）。返回 bool。
+    只认 success/CLAIMED*/replayed；绝不把 benefit.amount>0 或 rewardCredits>0
+    当成功——否则 {"status":"FAILED","benefit":{"amount":100}} 会被误判为已领取，
+    违背"没有明确成功证据就绝不绿"的 fail-close 不变量。"""
     if not isinstance(body, dict):
         return False
     try:
@@ -548,13 +556,8 @@ def _claim_succeeded(body):
     cs = str(b.get("claimStatus") or b.get("status") or "").upper()
     if cs in CLAIMED_STATUSES:
         return True
-    if _benefit_amount(b) > 0:
+    if b.get("replayed") is True:
         return True
-    try:
-        if int(b.get("rewardCredits") or 0) > 0:
-            return True
-    except (TypeError, ValueError):
-        pass
     return False
 
 
@@ -603,6 +606,11 @@ def do_checkin(token, uid):
     amount = _benefit_amount(target)
     cstatus = str(target.get("claimStatus") or "").upper()
 
+    if not isinstance(cid, str) or not cid.strip():
+        # 没有合法 campaignId 就无法构造 claim URL（否则会拼出 /campaigns/None/claim）
+        return EXIT_FAIL, {"result": "SCHEMA_FAIL",
+                           "error": "目标活动缺少合法 campaignId（%r），疑似响应改版。" % (cid,)}
+
     if cstatus in CLAIMED_STATUSES:
         return EXIT_OK, {"result": "ALREADY", "msg": "本轮已领取 %d Credits" % amount,
                          "reward_credits": amount, "campaign_id": cid}
@@ -631,8 +639,16 @@ def do_checkin(token, uid):
         return EXIT_TOKEN, {"result": "AUTH_FAIL",
                             "error": "claim 接口返回 %d，token 可能已失效" % status}
     if status == 409 or "ALREADY_CLAIMED" in text.upper():
-        return EXIT_OK, {"result": "ALREADY", "msg": "本轮已领取（claim 返回 409）",
-                         "reward_credits": amount, "campaign_id": cid}
+        # 409 只是 Conflict，不等价"已领取"；新 campaigns API 的 409 body 尚未 live 捕获。
+        # 一律复查：确认该 campaignId 真变 CLAIMED 才认 ALREADY，否则 fail-close。
+        if _reverify_claimed(token, uid, cid):
+            return EXIT_OK, {"result": "ALREADY",
+                             "msg": "本轮已领取（claim 冲突，复查确认 CLAIMED）",
+                             "reward_credits": amount, "campaign_id": cid,
+                             "verified": True}
+        return EXIT_FAIL, {"result": "CLAIM_FAIL",
+                           "error": "claim HTTP %d 冲突但复查未确认 CLAIMED %s"
+                                    % (status, text[:160])}
     if status >= 400:
         # 5xx 可能是"服务端已记账但网关报错"，先复查再判失败；4xx 是明确客户端错误，直接失败
         if status >= 500 and _reverify_claimed(token, uid, cid):
