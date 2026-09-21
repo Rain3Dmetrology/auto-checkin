@@ -468,6 +468,8 @@ class TestQoderCampaignFlow(unittest.TestCase):
             if method == "POST":
                 calls["claim"] += 1
                 self.assertIn("/claim", path)
+                if isinstance(claim_resp, Exception):
+                    raise claim_resp
             return claim_resp
 
         with mock.patch.object(qoder_checkin, "fetch_campaigns", fake_fetch), \
@@ -544,6 +546,42 @@ class TestQoderCampaignFlow(unittest.TestCase):
             [self._ok([_camp("CLAIMABLE")])], (503, "boom"))
         self.assertEqual(code, self.FAIL)
         self.assertEqual(res["result"], "CLAIM_FAIL")
+
+    def test_post_timeout_reverify_recovers(self):
+        # POST 超时/连接中断：服务端可能已记账但响应丢失。复查发现已 CLAIMED → OK(recovered)
+        code, res, calls = self._run(
+            [self._ok([_camp("CLAIMABLE")]), self._ok([_camp("CLAIMED")])],
+            RuntimeError("connection reset"))
+        self.assertEqual(code, self.OK)
+        self.assertEqual(res["result"], "OK")
+        self.assertTrue(res.get("verified"))
+        self.assertTrue(res.get("recovered"))
+        self.assertEqual(calls["fetch"], 2)
+
+    def test_post_timeout_reverify_still_claimable_fails(self):
+        code, res, calls = self._run(
+            [self._ok([_camp("CLAIMABLE")]), self._ok([_camp("CLAIMABLE")])],
+            RuntimeError("timed out"))
+        self.assertEqual(code, self.FAIL)
+        self.assertEqual(res["result"], "CLAIM_FAIL")
+        self.assertEqual(calls["fetch"], 2)
+
+    def test_post_500_reverify_recovers(self):
+        # 5xx 同样可能是"已记账但网关报错"，先复查再判失败
+        code, res, _ = self._run(
+            [self._ok([_camp("CLAIMABLE")]), self._ok([_camp("CLAIMED")])],
+            (500, "internal error"))
+        self.assertEqual(code, self.OK)
+        self.assertEqual(res["result"], "OK")
+        self.assertTrue(res.get("recovered"))
+
+    def test_post_400_no_reverify_fails(self):
+        # 4xx（非 401/403/409）是明确客户端错误，不必复查，直接可重试失败
+        code, res, calls = self._run(
+            [self._ok([_camp("CLAIMABLE")])], (400, "bad request"))
+        self.assertEqual(code, self.FAIL)
+        self.assertEqual(res["result"], "CLAIM_FAIL")
+        self.assertEqual(calls["fetch"], 1)
 
     def test_campaigns_auth_error_maps_to_token_exit(self):
         code, res, _ = self._run([("AUTH", None)], (200, {}))
@@ -772,11 +810,12 @@ class TestPowerShellScriptBom(unittest.TestCase):
         self.assertIn("AutoCheckin", self._read_bom("uninstall.ps1"))
 
 
-# ── 调度漂移防护：install.ps1 含 10:07 + check.py 能解析已注册触发器 ──
+# ── 调度漂移防护：install.ps1 触发数组 == check.py 期望全集 + 能解析已注册触发器 ──
 class TestDailyTriggerDrift(unittest.TestCase):
     """代码改了调度但已注册的 Windows 计划任务不会自动更新——隐性漂移。
-    install.ps1 必须含 10:07；check.py 必须能从 schtasks /xml 解析出已注册
-    触发器时间，以便发现"任务里缺 10:07"。"""
+    install.ps1 的触发数组必须与 check.EXPECTED_DAILY_TRIGGERS 完全一致（单一真相，
+    否则 check.py 会漏报缺失的触发点）；check.py 必须能从 schtasks /xml 解析出已注册
+    触发器时间。"""
 
     XML_WITH = (
         "<Triggers>"
@@ -789,9 +828,20 @@ class TestDailyTriggerDrift(unittest.TestCase):
         "<CalendarTrigger><StartBoundary>2026-09-21T12:37:00</StartBoundary></CalendarTrigger>"
         "</Triggers>")
 
-    def test_install_ps1_defines_1007(self):
+    def test_install_ps1_triggers_match_expected(self):
+        import re
         with open(os.path.join(HERE, "install.ps1"), encoding="utf-8-sig") as fh:
-            self.assertIn("10:07", fh.read())
+            text = fh.read()
+        # 锚定含引号 HH:MM 的 @(...) 数组，避开 install.ps1 里更早的文件名模式数组
+        m = re.search(r"@\(([^)]*\"\d{2}:\d{2}\"[^)]*)\)", text)
+        self.assertIsNotNone(m, "install.ps1 未找到触发时间数组")
+        times = set(re.findall(r'"(\d{2}:\d{2})"', m.group(1)))
+        self.assertEqual(
+            times, check.EXPECTED_DAILY_TRIGGERS,
+            "install.ps1 触发数组与 check.EXPECTED_DAILY_TRIGGERS 不一致，会漏报漂移")
+
+    def test_expected_set_includes_1007(self):
+        self.assertIn("10:07", check.EXPECTED_DAILY_TRIGGERS)
 
     def test_parse_trigger_times(self):
         self.assertEqual(check._parse_trigger_times(self.XML_WITH),
@@ -799,6 +849,12 @@ class TestDailyTriggerDrift(unittest.TestCase):
 
     def test_parse_detects_missing_1007(self):
         self.assertNotIn("10:07", check._parse_trigger_times(self.XML_WITHOUT))
+
+    def test_missing_set_diff(self):
+        # 已注册只有 00:23/12:37 时，应检出缺其余全部期望触发点
+        registered = check._parse_trigger_times(self.XML_WITHOUT)
+        self.assertEqual(check.EXPECTED_DAILY_TRIGGERS - registered,
+                         {"08:07", "10:07", "19:07", "22:37"})
 
     def test_parse_empty_xml(self):
         self.assertEqual(check._parse_trigger_times("<Task></Task>"), set())

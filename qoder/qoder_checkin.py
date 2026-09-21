@@ -59,9 +59,11 @@ PATH_CAMPAIGNS = "/sash/api/v1/me/campaigns"
 PATH_DEVICE_REFRESH = "/api/v1/deviceToken/refresh"
 ORIGIN = "https://qoder.com.cn"
 CLIENT_UA = "Go-http-client/2.0"   # deviceToken/refresh 沿用此 UA（已验证可用，勿动鉴权层）
-# 活动接口要求桌面端 Cosy 头；缺 Cosy-ClientType 时服务端返回空 campaigns（实测）。
+# 活动接口要求桌面端 Cosy 头；缺 Cosy-ClientType 时服务端返回空 campaigns
+# （2026-09-21 live 实证：仅本账号验证，非断言服务端永远只校验这一项）。
+# Cosy-Version 用本机 live 验证过的值，客户端升级后可经 QODER_COSY_VERSION 覆盖。
 COSY_CLIENT_TYPE = "10"
-COSY_VERSION = "0.3.4"          # 2026-09-21 实测被服务端接受的客户端版本
+COSY_VERSION = os.environ.get("QODER_COSY_VERSION", "0.3.4")
 CAMPAIGN_UA = "Qoder"
 CAMPAIGN_REFERER = "https://openapi.qoder.com.cn/growth-page/activity-iframe"
 DAILY_BENEFIT_AMOUNT = 100      # 每日活动固定 100 Credits（用于严格区分其它活动）
@@ -407,9 +409,11 @@ def ensure_token():
 # 活动接口
 # ---------------------------------------------------------------------------
 def _headers(token, uid):
-    """活动接口请求头。Cosy-ClientType 是关键 gate：缺失时服务端返回空 campaigns。
+    """活动接口请求头，对齐桌面端 activity iframe 的真实请求。
+    Cosy-ClientType 是 live 实证的关键 gate：缺失时服务端返回空 campaigns
+    （2026-09-21 仅本账号验证；不主张服务端永远只校验这一项，故整套 Cosy 头都带上）。
     旧 daily check-in 协议里自派的 X-Machine-ID/X-Session-ID/X-Request-ID 经实测
-    对 campaigns 接口无影响，已移除（与桌面端 activity iframe 的真实请求对齐）。"""
+    对 campaigns 接口无影响，已移除。"""
     return {
         "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/json",
@@ -554,6 +558,19 @@ def _claim_succeeded(body):
     return False
 
 
+def _reverify_claimed(token, uid, campaign_id):
+    """复查 campaigns，确认指定 campaignId 已变 CLAIMED。
+    既用于消灭"假成功"，也用于 POST 超时/5xx 后判断服务端是否其实已记账。"""
+    state, payload = fetch_campaigns(token, uid)
+    if state != "OK":
+        return False
+    for c in (payload.get("campaigns") or []):
+        if (isinstance(c, dict) and c.get("campaignId") == campaign_id
+                and str(c.get("claimStatus") or "").upper() in CLAIMED_STATUSES):
+            return True
+    return False
+
+
 def do_checkin(token, uid):
     """签到主流程：campaigns 驱动。返回 (exit_code, result_dict)。
 
@@ -596,7 +613,19 @@ def do_checkin(token, uid):
                            "error": "目标活动 claimStatus=%r 非 CLAIMED/CLAIMABLE，"
                                     "按失败上报（疑似活动状态枚举改版）。" % cstatus}
 
-    status, body = _api(claim_path(cid), "POST", token, uid, body=b"{}")
+    try:
+        status, body = _api(claim_path(cid), "POST", token, uid, body=b"{}")
+    except Exception as exc:
+        # POST 超时/连接中断：服务端可能已记账但响应丢失。先复查再判失败（recovered），
+        # 避免"其实领到了却报失败、下一轮又领一次"或"漏报成功"。
+        if _reverify_claimed(token, uid, cid):
+            return EXIT_OK, {"result": "OK",
+                             "msg": "领取成功（请求异常但复查已 CLAIMED）",
+                             "reward_credits": amount, "campaign_id": cid,
+                             "verified": True, "recovered": True}
+        return EXIT_FAIL, {"result": "CLAIM_FAIL",
+                           "error": "claim 请求异常且复查未确认 CLAIMED：%r" % (exc,)}
+
     text = str(body)
     if status in (401, 403):
         return EXIT_TOKEN, {"result": "AUTH_FAIL",
@@ -605,6 +634,12 @@ def do_checkin(token, uid):
         return EXIT_OK, {"result": "ALREADY", "msg": "本轮已领取（claim 返回 409）",
                          "reward_credits": amount, "campaign_id": cid}
     if status >= 400:
+        # 5xx 可能是"服务端已记账但网关报错"，先复查再判失败；4xx 是明确客户端错误，直接失败
+        if status >= 500 and _reverify_claimed(token, uid, cid):
+            return EXIT_OK, {"result": "OK",
+                             "msg": "领取成功（HTTP %d 但复查已 CLAIMED）" % status,
+                             "reward_credits": amount, "campaign_id": cid,
+                             "verified": True, "recovered": True}
         return EXIT_FAIL, {"result": "CLAIM_FAIL",
                            "error": "claim HTTP %d %s" % (status, text[:160])}
 
@@ -613,14 +648,9 @@ def do_checkin(token, uid):
                          "reward_credits": amount, "campaign_id": cid, "verified": False}
 
     # 无明确成功证据：复查 campaigns，确认该 campaignId 变 CLAIMED 才算成功（消灭假成功）
-    state2, payload2 = fetch_campaigns(token, uid)
-    if state2 == "OK":
-        for c in (payload2.get("campaigns") or []):
-            if (isinstance(c, dict) and c.get("campaignId") == cid
-                    and str(c.get("claimStatus") or "").upper() in CLAIMED_STATUSES):
-                return EXIT_OK, {"result": "OK", "msg": "领取成功（复查确认）",
-                                 "reward_credits": amount, "campaign_id": cid,
-                                 "verified": True}
+    if _reverify_claimed(token, uid, cid):
+        return EXIT_OK, {"result": "OK", "msg": "领取成功（复查确认）",
+                         "reward_credits": amount, "campaign_id": cid, "verified": True}
     return EXIT_FAIL, {"result": "CLAIM_FAIL",
                        "error": "claim 无明确成功证据且复查未确认 CLAIMED (resp=%s)"
                                 % text[:120]}
