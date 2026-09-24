@@ -142,6 +142,38 @@ def check_network():
             bad("%s (%s) 不可达: %s" % (name, url, exc))
 
 
+def _parse_trigger_times(xml_text):
+    """从 schtasks /query /xml 输出提取所有 <StartBoundary> 的 HH:MM（去重）。"""
+    import re
+    return set(re.findall(r"<StartBoundary>[^<]*T(\d{2}:\d{2}):\d{2}", xml_text or ""))
+
+
+# 期望的每日触发点全集，必须与 install.ps1 的触发数组一致（由测试绑定，防漂移）。
+EXPECTED_DAILY_TRIGGERS = {"00:23", "08:07", "10:07", "12:37", "19:07", "22:37"}
+
+
+def _check_daily_triggers():
+    """校验已注册的 AutoCheckinDaily 是否含全部期望触发点。
+    代码改了调度但已注册的 Windows 任务不会自动更新——这里发现这种隐性漂移。"""
+    try:
+        r = subprocess.run(["schtasks", "/query", "/tn", "AutoCheckinDaily", "/xml"],
+                           capture_output=True, timeout=15)
+        xml = (r.stdout or b"").decode("utf-8", "replace")
+    except Exception:
+        info("无法读取 AutoCheckinDaily 触发器详情")
+        return
+    times = _parse_trigger_times(xml)
+    if not times:
+        info("未解析到触发器时间（任务结构异常或权限不足）")
+        return
+    info("已注册触发点: %s" % " / ".join(sorted(times)))
+    missing = EXPECTED_DAILY_TRIGGERS - times
+    if missing:
+        bad("缺少触发点 %s：代码已更新但计划任务仍是旧配置，"
+            "请重跑 powershell -ExecutionPolicy Bypass -File .\\install.ps1"
+            % " / ".join(sorted(missing)))
+
+
 def check_tasks():
     section("计划任务")
     if os.name != "nt":
@@ -151,12 +183,16 @@ def check_tasks():
         try:
             r = subprocess.run(["schtasks", "/query", "/tn", name],
                                capture_output=True, timeout=15)
-            if r.returncode == 0:
-                ok("%s 已安装" % name)
-            else:
-                info("%s 未安装（运行 install.ps1 安装）" % name)
+            installed = (r.returncode == 0)
         except Exception:
             info("%s 查询失败" % name)
+            continue
+        if not installed:
+            info("%s 未安装（运行 install.ps1 安装）" % name)
+            continue
+        ok("%s 已安装" % name)
+        if name == "AutoCheckinDaily":
+            _check_daily_triggers()
 
 
 def check_health():
