@@ -3,7 +3,7 @@
 """核心逻辑单元测试（零依赖，python -m unittest tests.test_core）。
 
 覆盖六类关键契约：
-  1. Trae 退出码契约（summarize_results）：软限流不算失败，鉴权失败必须非 0
+  1. Trae 退出码契约（summarize_results）：软限流不算失败，鉴权失败/未开放必须非 0
   2. pick_batch 轮签（TRAE_BATCH 数字解析；历史缺陷：size 未定义导致 NameError）
   3. run_all 失败分类（classify_outcome）与连续失败计数（update_health）
   4. 手写 AES（CBC-128 / GCM-256）NIST 已知向量防回归
@@ -39,7 +39,7 @@ def _mk_result(status, name="t", detail=""):
 
 
 # ── Trae：退出码契约 ──────────────────────────────────────────
-# 0=成功/已签/软限流/未开放；非0=硬失败或需人工处理（鉴权失败）
+# 0=成功/已签/软限流；非0=硬失败/需人工处理（鉴权失败）/未开放（可重试）
 class TestTraeExitCode(unittest.TestCase):
     def test_all_success_exit_zero(self):
         st = trae_checkin.summarize_results([_mk_result("签到成功")])
@@ -54,10 +54,20 @@ class TestTraeExitCode(unittest.TestCase):
         st = trae_checkin.summarize_results([_mk_result("待重试")])
         self.assertEqual(st["exit"], 0)
 
-    def test_not_open_not_failure(self):
-        # enable=false 是服务端常态，人工无法处理，且当日状态已去重
+    def test_not_open_exits_nonzero(self):
+        # enable=false 是服务端临时状态：不记 done、退出非 0，run_all 判 RETRY，
+        # 下轮计划任务在开放后继续签（历史缺陷：enable=false 被 mark_done 记成
+        # "当天已完成"封死全天重试，且 exit 0 造成假绿）。
         st = trae_checkin.summarize_results([_mk_result("未开放")])
-        self.assertEqual(st["exit"], 0)
+        self.assertEqual(st["exit"], 1)
+
+    def test_source_never_marks_done_on_not_open(self):
+        # 回归守卫：enable=false 分支绝不能 mark_done(未开放)，否则封死全天重试。
+        src = os.path.join(HERE, "trae", "trae_checkin.py")
+        with open(src, encoding="utf-8") as fh:
+            text = fh.read()
+        seg = text.split("if enable is False", 1)[1].split("result['_claimed']", 1)[0]
+        self.assertNotIn("mark_done", seg)
 
     def test_auth_failure_exits_nonzero(self):
         st = trae_checkin.summarize_results([_mk_result("鉴权失败")])

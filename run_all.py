@@ -330,7 +330,7 @@ def classify_outcome(name, code, output):
     """把子任务 (退出码, 输出) 归入三态。判定依据是各子脚本的退出码契约：
       workbuddy  0 成功；1 NO_SESSION(需人工)/NETWORK/TIMEOUT(可重试)/ERROR；
                  2 NO_AUTH(未装未登录)/凭据损坏(需人工)
-      trae      0 成功/已签/待重试限流/未开放；1 硬失败或鉴权失败（stdout 有摘要）
+      trae      0 成功/已签/待重试限流；1 硬失败/鉴权失败/未开放（enable=false，可重试）
       qoder     0 成功/已领；2 未装(跳过)或解密失败(需人工)；
                  3 refreshToken 失效或活动接口拒鉴权(需人工)；
                  4 NO_CAMPAIGN/CLAIM_FAIL(瞬时,可重试) 或 SCHEMA_FAIL(改版,需人工)

@@ -936,14 +936,15 @@ def checkin_account(acc, cache):
         result['detail'] = '状态查询未成功，本轮不发起 claim：%s' % (raw or '')[:70]
         print('⏳ [结果] 状态不可用，跳过 claim')
         return result
-    # 服务端明确 enable=false 且鉴权正常 → 该账号确实没开放签到，
-    # 继续发 claim 只会白烧限流额度并拖累其它账号，直接判定未开放。
+    # 服务端明确 enable=false 且鉴权正常 → 该账号当前未开放签到。
+    # 关键：这是"临时"状态（10:00 窗口开放后多为 true），绝不能 mark_done
+    # 记成"当天已完成"，否则会封死全天后续重试；也不 exit 0 造成假绿。
+    # 不占 limit 额度，直接返回"未开放"交由 summarize_results 判非 0 → RETRY。
     if enable is False:
         result['icon'] = '🚫'
         result['status'] = '未开放'
-        result['detail'] = '该账号未开放签到（enable=false），不再重复请求'
+        result['detail'] = '该账号未开放签到（enable=false），本轮不记完成，下轮继续尝试'
         print('🚫 [结果] 未开放签到')
-        mark_done(_acct_key(acc), {'status': '未开放', 'credits': '-', 'at': bj()})
         return result
 
     result['_claimed'] = True          # 只有真正发过 claim 才需要账号间错峰
@@ -996,10 +997,11 @@ def summarize_results(results):
     """汇总结果并给出进程退出码契约（run_all.py 依赖它做失败分类）。
 
     退出码：
-      0 = 全部达成或设计内状态（成功 / 已签 / 待重试限流 / 未开放）
-      1 = 存在硬失败（失败 / 异常）或需人工处理（鉴权失败）
+      0 = 全部达成或设计内状态（成功 / 已签 / 待重试限流）
+      1 = 存在硬失败（失败 / 异常 / 鉴权失败）或未开放（enable=false，可重试）
     软限流（9074 待重试）不算失败：已记冷却，下轮计划任务自动补签。
-    "未开放"（enable=false）是服务端常态且当日已去重，同样不算失败。
+    "未开放"（enable=false）是服务端临时状态：不记 done、退出非 0（run_all 判 RETRY），
+    下轮计划任务在其开放后继续签——避免"临时未开放"被误记为当天完成而封死重试（假绿）。
     """
     ok_n = sum(1 for r in results if r['status'] == '签到成功')
     already_n = sum(1 for r in results if r['status'] == '已签到')
@@ -1014,7 +1016,7 @@ def summarize_results(results):
 
 # ══════════════════ 主流程 ══════════════════
 SOFT = ('待重试',)               # 限流类，冷却到点由 cron 补签，不算失败
-DEAD = ('未开放', '鉴权失败')      # 需要人工处理
+DEAD = ('鉴权失败',)             # 需要人工处理（硬失败）；未开放(enable=false)归可重试
 COOLDOWN_MIN = 55                # 平时 9074 冷却分钟数（实测 8 小时后仍未解除，一小时一试）
 PEAK_COOLDOWN_MIN = 12           # 早窗内的短冷却，好让下一轮还在窗口里补签
 GAP_MIN, GAP_MAX = 12, 25        # 实测 25s 间隔可让相邻账号连续签到成功

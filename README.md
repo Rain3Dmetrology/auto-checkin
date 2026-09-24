@@ -95,7 +95,7 @@ Get-Content logs\run_$(Get-Date -Format yyyy-MM-dd).log
 | 状态 | 含义 | 处理方式 |
 |------|------|---------|
 | OK | 成功 / 已签 / 设计内跳过（未安装、未登录） | 正常退出 |
-| RETRY | 瞬时失败（网络、超时、服务端 5xx、9074 限流） | 当前轮不重试，下一个触发点自动补签（每天 6+ 次机会，已签幂等跳过） |
+| RETRY | 瞬时失败（网络、超时、服务端 5xx、9074 限流、Trae `enable=false` 未开放） | 当前轮不重试，下一个触发点自动补签（每天 6+ 次机会，已签幂等跳过） |
 | NEEDS_HUMAN | 凭据/会话失效（重新登录才能解决）；或 Qoder 活动接口响应结构异常/未知状态（疑似 API 改版，`SCHEMA_FAIL`） | 重试无意义，落盘完整输出等待人工处理 |
 
 > **Qoder fail-close 说明**：Qoder 走官方活动领取接口 `GET /sash/api/v1/me/campaigns`
@@ -157,7 +157,8 @@ python -m unittest tests.test_core    # 零依赖：退出码契约/轮签/失�
 ```
 
 子脚本退出码契约（调度器失败分类的依据）：`run_all.py` 0 全部成功；1 存在失败项。
-`trae_checkin.py` 0 成功/已签/软限流/未开放，1 硬失败或鉴权失败；`qoder_checkin.py`
+`trae_checkin.py` 0 成功/已签/软限流，1 硬失败/鉴权失败/未开放（`enable=false` 系服务端
+临时状态，退出非 0 由调度器判 RETRY，下轮触发点在其开放后继续签，绝不记成"当天已完成"）；`qoder_checkin.py`
 0 成功/已领，2 凭据缺失或解密失败，3 token 失效无法续期或活动接口拒绝鉴权，4 未领取
 （一律 fail-close，绝不静默判成功）——其中 `NO_CAMPAIGN`/`CLAIM_FAIL` 归可重试、
 `SCHEMA_FAIL`（疑似 API 改版）归需人工排查。
