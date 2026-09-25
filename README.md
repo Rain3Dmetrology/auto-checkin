@@ -42,12 +42,14 @@ python run_all.py
 | 任务 | 触发时间 | 行为 |
 |------|---------|------|
 | AutoCheckinBoot | 每次登录后 90 秒 | 等网络就绪后签到（开机即签） |
-| AutoCheckinDaily | 每天 00:23 | 主力签到（Trae 避开整点限流高峰） |
-| AutoCheckinDaily | 10:07 | 对齐 Qoder CN 每日 10:00 开放的新一轮领取窗口 |
-| AutoCheckinDaily | 08:07 / 12:37 / 19:07 / 22:37 | 补签兜底（已签自动跳过，无多余领取请求） |
+| AutoCheckinDaily | 北京时间每天 00:23 | 主力签到（Trae 避开整点限流高峰） |
+| AutoCheckinDaily | 北京时间 10:07 | 对齐 Qoder CN 每日 10:00 开放的新一轮领取窗口 |
+| AutoCheckinDaily | 北京时间 08:07 / 12:37 / 19:07 / 22:37 | 补签兜底（已签自动跳过，无多余领取请求） |
 
-所有触发点带 0-5 分钟随机抖动错峰；关机/睡眠错过的时间点，开机后自动补跑
-（StartWhenAvailable）。
+业务时间统一固定为北京时间（UTC+8）。`install.ps1` 会自动转换为当前 Windows 本地时间再注册；
+例如东京（UTC+9）的 `10:07` 北京时间会注册成 `11:07` 本地时间。`check.py` 按 UTC 语义校验，
+不会因为系统时区与北京时间不同而误报漂移。所有触发点带 0-5 分钟随机抖动错峰；关机/睡眠
+错过的时间点，开机后自动补跑（StartWhenAvailable）。
 
 > **Qoder 物理限制**：官方活动每日 10:00 开新窗口、持续至次日 10:00，**错过不可补领、
 > 不累计**。`StartWhenAvailable` 只能让 Windows 任务在开机后补跑，无法让 Qoder 把已关闭
@@ -60,6 +62,7 @@ python run_all.py
 run_all.py（计划任务统一入口，pythonw.exe 静默运行）
  ├─ workbuddy\signin.py silent      WorkBuddy 签到 + 成长中心
  │   └─ 凭据: %LOCALAPPDATA%\CodeBuddyExtension\...\workbuddy-desktop.info
+ │        （兼容新版桌面端加密凭据；仅调用本机 WorkBuddy runtime 解密，不输出令牌）
  ├─ trae\trae_checkin.py            Trae 签到（抗 9074 限流）
  │   └─ 凭据: run_all 自动解密 %APPDATA%\TRAE SOLO CN\...\storage.json
  │        （纯标准库 AES 解出 refreshToken，经环境变量传递，不落盘）
@@ -146,15 +149,18 @@ refreshToken 也失效，打开一次 Qoder CN 桌面端重新登录即可（凭
   powershell -ExecutionPolicy Bypass -File .\install.ps1
   ```
   脚本用 `Register-ScheduledTask -Force`，会原地更新已有任务，不会重复创建。
-  可运行 `python check.py` 确认计划任务里已包含最新触发点（如 10:07）。
+  可运行 `python check.py` 确认计划任务按 UTC 语义对齐北京时间触发点；本地钟面会随系统时区变化（如东京的北京时间 10:07 显示为 11:07）。
 - ZIP 方式：重新下载解压，覆盖到原目录（同样：涉及调度变更需重跑 `install.ps1`）。
 - 上游 `signin.py` / `trae_checkin.py` 发布新版时，可直接替换对应子目录文件。
 
 ## 开发与测试
 
 ```powershell
-python -m unittest tests.test_core    # 零依赖：退出码契约/轮签/失败分类/健康计数/Qoder 状态机/AES 向量
+python -m unittest discover -s tests -p "test*.py"  # 全量回归：WorkBuddy/Trae/Qoder/调度/失败分类
 ```
+
+GitHub Actions 在 `windows-latest` 上对受支持的 Python 版本执行 compile + 全量单元测试；
+Release 前要求本机测试、部署体检与 CI 同时通过。
 
 子脚本退出码契约（调度器失败分类的依据）：`run_all.py` 0 全部成功；1 存在失败项。
 `trae_checkin.py` 0 成功/已签/软限流，1 硬失败/鉴权失败/未开放（`enable=false` 系服务端

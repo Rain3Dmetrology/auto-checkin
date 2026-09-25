@@ -925,54 +925,59 @@ class TestPowerShellScriptBom(unittest.TestCase):
         self.assertIn("AutoCheckin", self._read_bom("uninstall.ps1"))
 
 
-# ── 调度漂移防护：install.ps1 触发数组 == check.py 期望全集 + 能解析已注册触发器 ──
+# ── 调度漂移防护：业务时间固定为北京时间，计划任务按 offset/UTC 语义校验 ──
 class TestDailyTriggerDrift(unittest.TestCase):
-    """代码改了调度但已注册的 Windows 计划任务不会自动更新——隐性漂移。
-    install.ps1 的触发数组必须与 check.EXPECTED_DAILY_TRIGGERS 完全一致（单一真相，
-    否则 check.py 会漏报缺失的触发点）；check.py 必须能从 schtasks /xml 解析出已注册
-    触发器时间。"""
+    """本机时区可以不是 UTC+8；installer 与 check 必须围绕北京时间这个单一真相。"""
 
-    XML_WITH = (
+    XML_TOKYO = (
         "<Triggers>"
-        "<CalendarTrigger><StartBoundary>2026-09-21T00:23:00</StartBoundary></CalendarTrigger>"
-        "<CalendarTrigger><StartBoundary>2026-09-21T10:07:00</StartBoundary></CalendarTrigger>"
+        "<CalendarTrigger><StartBoundary>2026-09-21T01:23:00+09:00</StartBoundary></CalendarTrigger>"
+        "<CalendarTrigger><StartBoundary>2026-09-21T09:07:00+09:00</StartBoundary></CalendarTrigger>"
+        "<CalendarTrigger><StartBoundary>2026-09-21T11:07:00+09:00</StartBoundary></CalendarTrigger>"
+        "<CalendarTrigger><StartBoundary>2026-09-21T13:37:00+09:00</StartBoundary></CalendarTrigger>"
+        "<CalendarTrigger><StartBoundary>2026-09-21T20:07:00+09:00</StartBoundary></CalendarTrigger>"
+        "<CalendarTrigger><StartBoundary>2026-09-21T23:37:00+09:00</StartBoundary></CalendarTrigger>"
         "</Triggers>")
-    XML_WITHOUT = (
+    XML_WRONG_TOKYO = (
         "<Triggers>"
-        "<CalendarTrigger><StartBoundary>2026-09-21T00:23:00</StartBoundary></CalendarTrigger>"
-        "<CalendarTrigger><StartBoundary>2026-09-21T12:37:00</StartBoundary></CalendarTrigger>"
+        "<CalendarTrigger><StartBoundary>2026-09-21T10:07:00+09:00</StartBoundary></CalendarTrigger>"
         "</Triggers>")
 
-    def test_install_ps1_triggers_match_expected(self):
+    def test_install_ps1_beijing_triggers_match_expected(self):
         import re
         with open(os.path.join(HERE, "install.ps1"), encoding="utf-8-sig") as fh:
             text = fh.read()
-        # 锚定含引号 HH:MM 的 @(...) 数组，避开 install.ps1 里更早的文件名模式数组
-        m = re.search(r"@\(([^)]*\"\d{2}:\d{2}\"[^)]*)\)", text)
-        self.assertIsNotNone(m, "install.ps1 未找到触发时间数组")
+        m = re.search(r"\$BeijingTriggerTimes\s*=\s*@\(([^)]*)\)", text)
+        self.assertIsNotNone(m, "install.ps1 未找到 $BeijingTriggerTimes")
         times = set(re.findall(r'"(\d{2}:\d{2})"', m.group(1)))
+        self.assertEqual(times, check.EXPECTED_BEIJING_TRIGGERS)
+        self.assertIn("China Standard Time", text)
+        self.assertIn("Convert-BeijingClockToLocal", text)
+
+    def test_expected_set_includes_qoder_1007(self):
+        self.assertIn("10:07", check.EXPECTED_BEIJING_TRIGGERS)
+        self.assertIn("02:07", check.EXPECTED_UTC_TRIGGERS)
+
+    def test_tokyo_local_clock_is_displayed_but_utc_matches_beijing(self):
         self.assertEqual(
-            times, check.EXPECTED_DAILY_TRIGGERS,
-            "install.ps1 触发数组与 check.EXPECTED_DAILY_TRIGGERS 不一致，会漏报漂移")
+            check._parse_trigger_times(self.XML_TOKYO),
+            {"01:23", "09:07", "11:07", "13:37", "20:07", "23:37"})
+        self.assertEqual(
+            check._parse_trigger_utc_times(self.XML_TOKYO),
+            check.EXPECTED_UTC_TRIGGERS)
 
-    def test_expected_set_includes_1007(self):
-        self.assertIn("10:07", check.EXPECTED_DAILY_TRIGGERS)
+    def test_wrong_tokyo_1007_local_is_not_beijing_1007(self):
+        registered = check._parse_trigger_utc_times(self.XML_WRONG_TOKYO)
+        self.assertEqual(registered, {"01:07"})
+        self.assertNotIn("02:07", registered)
 
-    def test_parse_trigger_times(self):
-        self.assertEqual(check._parse_trigger_times(self.XML_WITH),
-                         {"00:23", "10:07"})
-
-    def test_parse_detects_missing_1007(self):
-        self.assertNotIn("10:07", check._parse_trigger_times(self.XML_WITHOUT))
-
-    def test_missing_set_diff(self):
-        # 已注册只有 00:23/12:37 时，应检出缺其余全部期望触发点
-        registered = check._parse_trigger_times(self.XML_WITHOUT)
-        self.assertEqual(check.EXPECTED_DAILY_TRIGGERS - registered,
-                         {"08:07", "10:07", "19:07", "22:37"})
+    def test_expected_utc_set_is_fixed(self):
+        self.assertEqual(check.EXPECTED_UTC_TRIGGERS,
+                         {"16:23", "00:07", "02:07", "04:37", "11:07", "14:37"})
 
     def test_parse_empty_xml(self):
         self.assertEqual(check._parse_trigger_times("<Task></Task>"), set())
+        self.assertEqual(check._parse_trigger_utc_times("<Task></Task>"), set())
 
 
 if __name__ == "__main__":
