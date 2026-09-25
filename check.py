@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+from datetime import datetime, timedelta, timezone
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -142,19 +143,56 @@ def check_network():
             bad("%s (%s) 不可达: %s" % (name, url, exc))
 
 
-def _parse_trigger_times(xml_text):
-    """从 schtasks /query /xml 输出提取所有 <StartBoundary> 的 HH:MM（去重）。"""
+def _parse_trigger_boundaries(xml_text):
+    """从 schtasks /query /xml 输出提取 <StartBoundary> 原始值。"""
     import re
-    return set(re.findall(r"<StartBoundary>[^<]*T(\d{2}:\d{2}):\d{2}", xml_text or ""))
+    return re.findall(r"<StartBoundary>([^<]+)</StartBoundary>", xml_text or "")
 
 
-# 期望的每日触发点全集，必须与 install.ps1 的触发数组一致（由测试绑定，防漂移）。
-EXPECTED_DAILY_TRIGGERS = {"00:23", "08:07", "10:07", "12:37", "19:07", "22:37"}
+def _parse_trigger_times(xml_text):
+    """仅用于展示：提取计划任务 XML 中的本地钟面 HH:MM。"""
+    out = set()
+    for raw in _parse_trigger_boundaries(xml_text):
+        try:
+            out.add(raw.split("T", 1)[1][0:5])
+        except Exception:
+            continue
+    return out
+
+
+BEIJING_TZ = timezone(timedelta(hours=8))
+EXPECTED_BEIJING_TRIGGERS = {"00:23", "08:07", "10:07", "12:37", "19:07", "22:37"}
+
+
+def _clock_to_utc(clock_text, tzinfo):
+    hh, mm = (int(x) for x in clock_text.split(":", 1))
+    dt = datetime(2026, 1, 15, hh, mm, tzinfo=tzinfo)
+    return dt.astimezone(timezone.utc).strftime("%H:%M")
+
+
+EXPECTED_UTC_TRIGGERS = {_clock_to_utc(x, BEIJING_TZ)
+                         for x in EXPECTED_BEIJING_TRIGGERS}
+
+
+def _parse_trigger_utc_times(xml_text):
+    """把 StartBoundary（含 offset/Z；无 offset 时按本机时区）归一化到 UTC HH:MM。"""
+    out = set()
+    for raw in _parse_trigger_boundaries(xml_text):
+        try:
+            value = raw.strip()
+            if value.endswith("Z"):
+                value = value[:-1] + "+00:00"
+            dt = datetime.fromisoformat(value)
+            if dt.tzinfo is None:
+                dt = dt.astimezone()
+            out.add(dt.astimezone(timezone.utc).strftime("%H:%M"))
+        except Exception:
+            continue
+    return out
 
 
 def _check_daily_triggers():
-    """校验已注册的 AutoCheckinDaily 是否含全部期望触发点。
-    代码改了调度但已注册的 Windows 任务不会自动更新——这里发现这种隐性漂移。"""
+    """按 UTC 语义校验任务是否仍对齐北京时间触发点，避免系统时区导致假漂移。"""
     try:
         r = subprocess.run(["schtasks", "/query", "/tn", "AutoCheckinDaily", "/xml"],
                            capture_output=True, timeout=15)
@@ -162,16 +200,24 @@ def _check_daily_triggers():
     except Exception:
         info("无法读取 AutoCheckinDaily 触发器详情")
         return
-    times = _parse_trigger_times(xml)
-    if not times:
+    local_times = _parse_trigger_times(xml)
+    utc_times = _parse_trigger_utc_times(xml)
+    if not local_times or not utc_times:
         info("未解析到触发器时间（任务结构异常或权限不足）")
         return
-    info("已注册触发点: %s" % " / ".join(sorted(times)))
-    missing = EXPECTED_DAILY_TRIGGERS - times
+    info("已注册本地触发点: %s" % " / ".join(sorted(local_times)))
+    missing = EXPECTED_UTC_TRIGGERS - utc_times
+    unexpected = utc_times - EXPECTED_UTC_TRIGGERS
     if missing:
-        bad("缺少触发点 %s：代码已更新但计划任务仍是旧配置，"
-            "请重跑 powershell -ExecutionPolicy Bypass -File .\\install.ps1"
+        bad("按北京时间语义缺少触发点（UTC %s）：请重跑 "
+            "powershell -ExecutionPolicy Bypass -File .\\install.ps1"
             % " / ".join(sorted(missing)))
+    elif unexpected:
+        bad("检测到额外/偏移的触发点（UTC %s）：请重跑 "
+            "powershell -ExecutionPolicy Bypass -File .\\install.ps1"
+            % " / ".join(sorted(unexpected)))
+    else:
+        ok("6 个触发点已按北京时间语义对齐（系统时区变化不会误报）")
 
 
 def check_tasks():

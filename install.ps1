@@ -8,7 +8,7 @@
 #
 # 创建两个计划任务（全部静默、无窗口、错过自动补跑）：
 #   AutoCheckinBoot   用户登录后 90 秒    开机即签（等网络就绪）
-#   AutoCheckinDaily  每天 00:23 / 08:07 / 10:07 / 12:37 / 19:07 / 22:37（随机延迟数分钟错峰）
+#   AutoCheckinDaily  每天北京时间 00:23 / 08:07 / 10:07 / 12:37 / 19:07 / 22:37（自动换算本地时区）
 #
 # 说明：
 #   - 00:23 是 Trae 的最佳签到窗口（避开 00:00-00:10 整点排队限流高峰）
@@ -24,6 +24,24 @@ $ErrorActionPreference = "Stop"
 $ManualPythonw = ""   # 例如 C:\Python313\pythonw.exe
 $ManualRunAll  = ""   # 例如 C:\Users\You\auto-checkin\run_all.py
 # ====================================================
+
+# 统一以北京时间（UTC+8）定义业务触发点，再转换为当前 Windows 本地时间注册。
+# 这样东京等非 UTC+8 系统不会把 Qoder 10:07 北京时间误装成 10:07 本地时间。
+$BeijingTriggerTimes = @("00:23", "08:07", "10:07", "12:37", "19:07", "22:37")
+$BeijingTimeZone = [TimeZoneInfo]::FindSystemTimeZoneById("China Standard Time")
+
+function Convert-BeijingClockToLocal {
+    param([Parameter(Mandatory=$true)][string]$Clock)
+    $parts = $Clock.Split(':')
+    if ($parts.Count -ne 2) { throw "无效北京时间: $Clock" }
+    $hh = [int]$parts[0]
+    $mm = [int]$parts[1]
+    $bjNow = [TimeZoneInfo]::ConvertTimeFromUtc([DateTime]::UtcNow, $BeijingTimeZone)
+    $bjWall = [DateTime]::SpecifyKind(
+        $bjNow.Date.AddHours($hh).AddMinutes($mm), [DateTimeKind]::Unspecified)
+    $utc = [TimeZoneInfo]::ConvertTimeToUtc($bjWall, $BeijingTimeZone)
+    return [TimeZoneInfo]::ConvertTimeFromUtc($utc, [TimeZoneInfo]::Local)
+}
 
 function Find-Pythonw {
     # 1) PATH 里就有 pythonw
@@ -117,8 +135,9 @@ try {
     #   08:07 为上一 Qoder 窗口最后兜底；其余为幂等补签兜底
     #   -RandomDelay 再加 0-5 分钟随机抖动，避免与同批用户撞车
     $triD = @()
-    foreach ($hh in @("00:23", "08:07", "10:07", "12:37", "19:07", "22:37")) {
-        $t = New-ScheduledTaskTrigger -Daily -At $hh -RandomDelay (New-TimeSpan -Minutes 5)
+    foreach ($hh in $BeijingTriggerTimes) {
+        $localAt = Convert-BeijingClockToLocal $hh
+        $t = New-ScheduledTaskTrigger -Daily -At $localAt -RandomDelay (New-TimeSpan -Minutes 5)
         $triD += $t
     }
     $actD = New-ScheduledTaskAction -Execute $pythonw -Argument "`"$runall`""
@@ -140,9 +159,12 @@ Write-Host " 完成" -ForegroundColor Green
 # --- 收尾汇报 ---
 Write-Host ""
 Write-Host "两个计划任务已就位：" -ForegroundColor Green
+$localSchedule = ($BeijingTriggerTimes | ForEach-Object {
+    (Convert-BeijingClockToLocal $_).ToString("HH:mm")
+}) -join "/"
 foreach ($row in @(
     @{ Name = "AutoCheckinBoot";  When = "每次登录后90秒" },
-    @{ Name = "AutoCheckinDaily"; When = "00:23/08:07/10:07/12:37/19:07/22:37" }
+    @{ Name = "AutoCheckinDaily"; When = "北京时间 $($BeijingTriggerTimes -join '/')；本地 $localSchedule" }
 )) {
     $t = Get-ScheduledTask -TaskName $row.Name
     $i = Get-ScheduledTaskInfo -TaskName $row.Name
