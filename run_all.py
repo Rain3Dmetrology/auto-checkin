@@ -340,7 +340,7 @@ def classify_outcome(name, code, output):
     out = output or ""
 
     if name == "workbuddy":
-        if "NO_SESSION" in out:
+        if any(reason in out for reason in ("NO_SESSION", "AUTH_ERROR", "AUTH_REJECTED", "FORBIDDEN")):
             return OUTCOME_HUMAN
         if "NETWORK" in out or "TIMEOUT" in out:
             return OUTCOME_RETRY
