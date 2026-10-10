@@ -161,7 +161,7 @@ def _parse_trigger_times(xml_text):
 
 
 BEIJING_TZ = timezone(timedelta(hours=8))
-EXPECTED_BEIJING_TRIGGERS = {"00:23", "08:07", "10:07", "12:37", "19:07", "22:37"}
+EXPECTED_BEIJING_TRIGGERS = {"00:23", "08:07", "10:07", "19:07"}
 
 
 def _clock_to_utc(clock_text, tzinfo):

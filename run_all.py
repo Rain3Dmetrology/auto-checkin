@@ -509,6 +509,46 @@ def task_qoder(poll=None):
 TASKS = {"workbuddy": task_workbuddy, "trae": task_trae, "qoder": task_qoder}
 
 
+def acquire_runner_lock():
+    """Serialize AutoCheckinBoot and AutoCheckinDaily across separate task definitions."""
+    os.makedirs(LOG_DIR, exist_ok=True)
+    path = os.path.join(LOG_DIR, "run_all.lock")
+    handle = open(path, "a+b")
+    try:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return handle
+    except (OSError, ImportError):
+        handle.close()
+        return None
+
+
+def release_runner_lock(handle):
+    if handle is None:
+        return
+    try:
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except (OSError, ImportError):
+        pass
+    finally:
+        handle.close()
+
+
 def main():
     argv = sys.argv[1:]
     poll = "--poll" in argv or "--boot" in argv
@@ -547,4 +587,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    _runner_lock = acquire_runner_lock()
+    if _runner_lock is None:
+        log("检测到另一轮 AutoCheckin 正在执行；本次重复触发安全跳过")
+        sys.exit(0)
+    try:
+        main()
+    finally:
+        release_runner_lock(_runner_lock)
