@@ -44,7 +44,7 @@ python run_all.py
 | AutoCheckinBoot | 每次登录后 90 秒 | 等网络就绪后签到（开机即签） |
 | AutoCheckinDaily | 北京时间每天 00:23 | 主力签到（Trae 避开整点限流高峰） |
 | AutoCheckinDaily | 北京时间 10:07 | 对齐 Qoder CN 每日 10:00 开放的新一轮领取窗口 |
-| AutoCheckinDaily | 北京时间 08:07 / 12:37 / 19:07 / 22:37 | 补签兜底（已签自动跳过，无多余领取请求） |
+| AutoCheckinDaily | 北京时间 08:07 / 19:07 | 上一轮 Qoder 窗口最后兜底与晚间补签（已签自动跳过） |
 
 业务时间统一固定为北京时间（UTC+8）。`install.ps1` 会自动转换为当前 Windows 本地时间再注册；
 例如东京（UTC+9）的 `10:07` 北京时间会注册成 `11:07` 本地时间。`check.py` 按 UTC 语义校验，
@@ -122,7 +122,7 @@ Get-Content logs\run_$(Get-Date -Format yyyy-MM-dd).log
 
 **Q: Trae 签到显示 9074 / 待重试？**
 正常现象。9074 是服务端按时间窗排队的容量限制（与你的网络无关），脚本会自动
-记冷却并交给下一个时间点补签。实测 00:23 前后成功率最高，全天共 6+ 次机会。
+记冷却并交给下一个时间点补签。实测 00:23 前后成功率最高，每天 4 个固定时点，另有登录后补跑。
 
 **Q: Qoder 提示 token 过期/续期失败？**
 dt- token 约 30 天有效。脚本会用 refreshToken（约 1 年有效）自动续期。若

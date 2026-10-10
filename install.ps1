@@ -27,7 +27,7 @@ $ManualRunAll  = ""   # 例如 C:\Users\You\auto-checkin\run_all.py
 
 # 统一以北京时间（UTC+8）定义业务触发点，再转换为当前 Windows 本地时间注册。
 # 这样东京等非 UTC+8 系统不会把 Qoder 10:07 北京时间误装成 10:07 本地时间。
-$BeijingTriggerTimes = @("00:23", "08:07", "10:07", "12:37", "19:07", "22:37")
+$BeijingTriggerTimes = @("00:23", "08:07", "10:07", "19:07")
 $BeijingTimeZone = [TimeZoneInfo]::FindSystemTimeZoneById("China Standard Time")
 
 function Convert-BeijingClockToLocal {

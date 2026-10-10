@@ -190,7 +190,7 @@ class TestClassifyOutcome(unittest.TestCase):
 
     def test_qoder_no_campaign_retry(self):
         # campaigns 里暂时没有每日 100 活动：多为未到 10:00 窗口/传播延迟，
-        # 归 RETRY 让后续 12:37/19:07/22:37 档兜底；连续多次仍无由 health 计数暴露。
+        # 归 RETRY 让后续 19:07 档兜底；连续多次仍无由 health 计数暴露。
         self.assertEqual(run_all.classify_outcome(
             "qoder", 4, '{"result": "NO_CAMPAIGN", "error": "未找到目标活动"}'),
             run_all.OUTCOME_RETRY)
@@ -934,9 +934,7 @@ class TestDailyTriggerDrift(unittest.TestCase):
         "<CalendarTrigger><StartBoundary>2026-09-21T01:23:00+09:00</StartBoundary></CalendarTrigger>"
         "<CalendarTrigger><StartBoundary>2026-09-21T09:07:00+09:00</StartBoundary></CalendarTrigger>"
         "<CalendarTrigger><StartBoundary>2026-09-21T11:07:00+09:00</StartBoundary></CalendarTrigger>"
-        "<CalendarTrigger><StartBoundary>2026-09-21T13:37:00+09:00</StartBoundary></CalendarTrigger>"
         "<CalendarTrigger><StartBoundary>2026-09-21T20:07:00+09:00</StartBoundary></CalendarTrigger>"
-        "<CalendarTrigger><StartBoundary>2026-09-21T23:37:00+09:00</StartBoundary></CalendarTrigger>"
         "</Triggers>")
     XML_WRONG_TOKYO = (
         "<Triggers>"
@@ -961,7 +959,7 @@ class TestDailyTriggerDrift(unittest.TestCase):
     def test_tokyo_local_clock_is_displayed_but_utc_matches_beijing(self):
         self.assertEqual(
             check._parse_trigger_times(self.XML_TOKYO),
-            {"01:23", "09:07", "11:07", "13:37", "20:07", "23:37"})
+            {"01:23", "09:07", "11:07", "20:07"})
         self.assertEqual(
             check._parse_trigger_utc_times(self.XML_TOKYO),
             check.EXPECTED_UTC_TRIGGERS)
@@ -973,7 +971,7 @@ class TestDailyTriggerDrift(unittest.TestCase):
 
     def test_expected_utc_set_is_fixed(self):
         self.assertEqual(check.EXPECTED_UTC_TRIGGERS,
-                         {"16:23", "00:07", "02:07", "04:37", "11:07", "14:37"})
+                         {"16:23", "00:07", "02:07", "11:07"})
 
     def test_parse_empty_xml(self):
         self.assertEqual(check._parse_trigger_times("<Task></Task>"), set())
