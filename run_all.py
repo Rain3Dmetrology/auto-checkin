@@ -482,6 +482,28 @@ def task_trae(poll=None):
         log("trae 跳过：%s" % cred["error"])
         return 0, None     # 未装/未登录不算失败，避免拖累整体退出码
     env = {"TRAE_REFRESH_TOKEN": cred["refreshToken"]}
+    # A fresh interactive login updates the desktop client's storage.json, but
+    # the script's rotating-token cache can still contain an older, now-revoked
+    # refresh token. If the client storage is newer than that cache, prefer the
+    # freshly logged-in credential for this run; a successful refresh rewrites
+    # the cache with the new token pair.
+    storage_path = cred.get("path")
+    cache_path = os.environ.get("TRAE_TOKEN_CACHE", "").strip()
+    if not cache_path:
+        for candidate in (os.path.join("/ql/data/config", ".trae_token_cache.json"),
+                          os.path.join(HERE, "trae", ".trae_token_cache.json")):
+            if os.path.isdir(os.path.dirname(candidate)):
+                cache_path = candidate
+                break
+    try:
+        if (storage_path and cache_path and os.path.isfile(storage_path)
+                and os.path.isfile(cache_path)
+                and os.path.getmtime(storage_path) > os.path.getmtime(cache_path) + 2):
+            env["TRAE_PREFER_CLIENT_CREDENTIALS"] = "1"
+            log("检测到 Trae 客户端凭据更新时间晚于 token 缓存；本轮优先使用重新登录凭据")
+    except OSError:
+        # Do not fail the whole signin run if timestamps are unavailable.
+        pass
     if cred.get("device"):
         env["TRAE_DEVICE_ID"] = cred["device"]
     if cred.get("uid"):

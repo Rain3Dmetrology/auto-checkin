@@ -89,6 +89,39 @@ class TestTraeExitCode(unittest.TestCase):
         self.assertEqual((st["ok"], st["already"], st["soft"]), (1, 1, 1))
 
 
+class TestTraeCredentialCachePrecedence(unittest.TestCase):
+    def setUp(self):
+        self.accounts = [{
+            "uid": "fresh-login-user",
+            "accessToken": "",
+            "refreshToken": "new-client-refresh-token",
+            "name": "test",
+        }]
+        self.cache = {
+            "fresh-login-user": {
+                "accessToken": "stale-cached-access-token",
+                "refreshToken": "stale-cached-refresh-token",
+                "updatedAt": 100,
+            }
+        }
+
+    def test_cache_still_wins_without_fresh_login_signal(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("TRAE_PREFER_CLIENT_CREDENTIALS", None)
+            result = trae_checkin.apply_cache([dict(self.accounts[0])],
+                                               cache=self.cache)
+        self.assertEqual(result[0]["refreshToken"], "stale-cached-refresh-token")
+        self.assertEqual(result[0]["accessToken"], "stale-cached-access-token")
+
+    def test_fresh_client_login_bypasses_older_token_cache(self):
+        with mock.patch.dict(os.environ,
+                             {"TRAE_PREFER_CLIENT_CREDENTIALS": "1"}):
+            result = trae_checkin.apply_cache([dict(self.accounts[0])],
+                                               cache=self.cache)
+        self.assertEqual(result[0]["refreshToken"], "new-client-refresh-token")
+        self.assertEqual(result[0]["accessToken"], "")
+
+
 # ── Trae：pick_batch 轮签 ─────────────────────────────────────
 class TestPickBatch(unittest.TestCase):
     def setUp(self):

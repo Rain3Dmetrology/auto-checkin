@@ -295,7 +295,16 @@ def put_cache(cache, acc):
 
 
 def apply_cache(accounts, cache=None):
-    """用缓存里更新的 token 覆盖静态环境变量里的旧 token。"""
+    """用缓存里更新的 token 覆盖静态环境变量里的旧 token。
+
+    A newer Trae desktop storage file indicates a fresh interactive login;
+    in that case the caller sets TRAE_PREFER_CLIENT_CREDENTIALS so a revoked
+    cached refresh token cannot override the newly logged-in credential.
+    """
+    prefer_client = os.getenv('TRAE_PREFER_CLIENT_CREDENTIALS', '').strip().lower()
+    if prefer_client in ('1', 'true', 'yes', 'on'):
+        print('🆕 [缓存] 检测到客户端重新登录，跳过旧 token 缓存')
+        return accounts
     cache = load_cache() if cache is None else cache
     if not cache:
         return accounts
