@@ -95,7 +95,7 @@ import base64, glob, hashlib, json, os, platform, random, sys, time, urllib.requ
 
 UgHost = 'https://api.trae.cn'
 OAuthHost = 'https://api.trae.com.cn'
-ClientID = 'en1oxy7wnw8j9n'
+ClientID = 'ono9krqynydwx5'
 IdeVersion = '1.107.1'
 UA = 'Trae/%s' % IdeVersion
 EP_STATUS = UgHost + '/trae/api/v2/ug/checkin_credits/status'
