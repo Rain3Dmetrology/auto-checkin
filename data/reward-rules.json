@@ -1,0 +1,262 @@
+{
+  "schema_version": 1,
+  "compiled_at": "2026-11-13",
+  "timezone_policy": "All times are explicit IANA/UTC+8 values; do not infer from the Windows host timezone.",
+  "runtime_policy": "This registry is descriptive metadata only. It must never select endpoints, change request payloads, or trigger an API claim.",
+  "rules": [
+    {
+      "rule_id": "qoder-cn-daily-personal",
+      "provider_id": "qoder-cn",
+      "provider_name": "Qoder CN",
+      "status": "official_verified",
+      "verification_date": "2026-11-13",
+      "reward": {
+        "kind": "credits",
+        "amount": 100,
+        "currency": "Credits",
+        "scope": "Qoder CN product family"
+      },
+      "cadence": "daily_claim_window",
+      "claim_window": {
+        "timezone": "Asia/Shanghai",
+        "opens": "10:00",
+        "closes": "10:00",
+        "close_semantics": "exclusive_next_day",
+        "missed_window_can_be_reclaimed": false
+      },
+      "eligibility": {
+        "account_type": "individual",
+        "plans": [
+          "free",
+          "individual_paid",
+          "membership_card"
+        ],
+        "enterprise": false
+      },
+      "expiry": {
+        "duration": 30,
+        "unit": "days",
+        "anchor": "claim_time",
+        "per_grant_expiry": true
+      },
+      "claim_channel": "Qoder CN desktop client",
+      "automation": {
+        "adapter_in_repo": true,
+        "rule_drives_request": false,
+        "success_requires": "explicit_claim_success_or_campaign_state_reverification"
+      },
+      "sources": [
+        {
+          "type": "official",
+          "url": "https://docs.qoder.cn/events/100credits",
+          "checked_at": "2026-11-13"
+        }
+      ],
+      "notes": [
+        "该活动开始于 2026-09-18 10:00，结束时间以厂商另行公告为准。",
+        "100 Credits 是活动奖励，不等于套餐额度；不同领取批次各自计算 30 天有效期。",
+        "错过当轮窗口不可补领；未领取的额度不会结转。"
+      ]
+    },
+    {
+      "rule_id": "trae-cn-daily-free",
+      "provider_id": "trae-cn",
+      "provider_name": "TRAE CN",
+      "status": "official_verified",
+      "verification_date": "2026-11-13",
+      "reward": {
+        "kind": "points",
+        "amount": 150,
+        "currency": "积分",
+        "tier": "free"
+      },
+      "cadence": "daily",
+      "claim_window": {
+        "timezone": "Asia/Shanghai",
+        "opens": null,
+        "closes": null,
+        "semantics": "daily sign-in; exact server window not published on the billing page"
+      },
+      "eligibility": {
+        "account_type": "individual",
+        "tier": "free"
+      },
+      "expiry": {
+        "duration": 31,
+        "unit": "natural_days",
+        "anchor": "grant_time",
+        "per_grant_expiry": true
+      },
+      "claim_channel": "TRAE desktop client; profile menu > sign-in",
+      "automation": {
+        "adapter_in_repo": true,
+        "rule_drives_request": false,
+        "success_requires": "business_code_success_or_already_claimed"
+      },
+      "sources": [
+        {
+          "type": "official",
+          "url": "https://docs.trae.cn/ide_plans-and-billing",
+          "checked_at": "2026-11-13"
+        }
+      ],
+      "notes": [
+        "官方计费文档列明免费用户每日签到 150 积分、有效期 31 个自然日。",
+        "此条只对应免费用户；不要将其套用到会员账号。"
+      ]
+    },
+    {
+      "rule_id": "trae-cn-daily-member",
+      "provider_id": "trae-cn",
+      "provider_name": "TRAE CN",
+      "status": "official_verified",
+      "verification_date": "2026-11-13",
+      "reward": {
+        "kind": "points",
+        "amount": 200,
+        "currency": "积分",
+        "tier": "member"
+      },
+      "cadence": "daily",
+      "claim_window": {
+        "timezone": "Asia/Shanghai",
+        "opens": null,
+        "closes": null,
+        "semantics": "daily sign-in; exact server window not published on the billing page"
+      },
+      "eligibility": {
+        "account_type": "individual",
+        "tier": "paid_member"
+      },
+      "expiry": {
+        "duration": 31,
+        "unit": "natural_days",
+        "anchor": "grant_time",
+        "per_grant_expiry": true
+      },
+      "claim_channel": "TRAE desktop client; profile menu > sign-in",
+      "automation": {
+        "adapter_in_repo": true,
+        "rule_drives_request": false,
+        "success_requires": "business_code_success_or_already_claimed"
+      },
+      "sources": [
+        {
+          "type": "official",
+          "url": "https://docs.trae.cn/ide_plans-and-billing",
+          "checked_at": "2026-11-13"
+        }
+      ],
+      "notes": [
+        "官方计费文档列明会员用户每日签到 200 积分、有效期 31 个自然日。",
+        "此条只对应会员账号；实际到账数应以 API/客户端返回为准。"
+      ]
+    },
+    {
+      "rule_id": "trae-cn-daily-unknown-tier",
+      "provider_id": "trae-cn",
+      "provider_name": "TRAE CN",
+      "status": "official_verified",
+      "verification_date": "2026-11-13",
+      "reward": {
+        "kind": "points",
+        "amount": null,
+        "currency": "积分",
+        "tier": "unknown"
+      },
+      "cadence": "daily",
+      "claim_window": {
+        "timezone": "Asia/Shanghai",
+        "opens": null,
+        "closes": null,
+        "semantics": "daily sign-in; exact server window not published on the billing page"
+      },
+      "eligibility": {
+        "account_type": "individual",
+        "tier": "verify_from_actual_account"
+      },
+      "expiry": {
+        "duration": null,
+        "unit": "unknown",
+        "anchor": "unknown",
+        "per_grant_expiry": null
+      },
+      "claim_channel": "TRAE desktop client; profile menu > sign-in",
+      "automation": {
+        "adapter_in_repo": true,
+        "rule_drives_request": false,
+        "success_requires": "business_code_success_or_already_claimed"
+      },
+      "sources": [
+        {
+          "type": "official",
+          "url": "https://docs.trae.cn/ide_plans-and-billing",
+          "checked_at": "2026-11-13"
+        }
+      ],
+      "notes": [
+        "当实际 API 未返回明确金额，或无法确认账号等级时，使用此通用记录。若回包明确返回 150 或 200 积分，应分别归类为免费或会员档。",
+        "不得从未知金额推断账号是免费或会员。"
+      ]
+    },
+    {
+      "rule_id": "workbuddy-cn-daily-checkin",
+      "provider_id": "workbuddy-cn",
+      "provider_name": "WorkBuddy",
+      "status": "secondary_verified_needs_official_confirmation",
+      "verification_date": "2026-11-13",
+      "reward": {
+        "kind": "points",
+        "amount": null,
+        "currency": "积分",
+        "tier": "account_rules_may_vary"
+      },
+      "cadence": "daily_with_rounds",
+      "claim_window": {
+        "timezone": "Asia/Shanghai",
+        "opens": null,
+        "closes": null,
+        "semantics": "round-based; rely on the account's Buddy 加油站 page, not a hard-coded global schedule"
+      },
+      "eligibility": {
+        "account_type": "unknown",
+        "tier": "account-specific"
+      },
+      "expiry": {
+        "duration": null,
+        "unit": "unknown",
+        "anchor": "unknown",
+        "per_grant_expiry": null
+      },
+      "claim_channel": "WorkBuddy desktop client / Buddy 加油站",
+      "automation": {
+        "adapter_in_repo": true,
+        "rule_drives_request": false,
+        "status": "manual_review_required",
+        "note": "第三方积分目录提示脚本签到可能触发异常检测；尚未取得对应的厂商公开自动化许可说明。"
+      },
+      "sources": [
+        {
+          "type": "third_party_directory",
+          "url": "https://aihot.news/free-tokens",
+          "checked_at": "2026-11-08"
+        },
+        {
+          "type": "third_party_directory",
+          "url": "https://igetoken.com/perks/",
+          "checked_at": "2026-10-28"
+        },
+        {
+          "type": "third_party_report",
+          "url": "https://cloud.tencent.com/developer/article/2779283",
+          "checked_at": "2026-11-13"
+        }
+      ],
+      "notes": [
+        "现有第三方资料对每日签到奖励报道不一（约 100–150 积分），尚未找到厂商公开的官方活动规则。不固定声明奖励金额，只将实际 API 确认的金额记入本地台账。",
+        "积分期次、连续签到奖励、截止时间和到期日必须以账号当前页面为准。",
+        "不得据此推断所有账号都具有相同活动资格或相同奖励。"
+      ]
+    }
+  ]
+}

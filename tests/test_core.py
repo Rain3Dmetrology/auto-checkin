@@ -123,6 +123,30 @@ class TestTraeCredentialCachePrecedence(unittest.TestCase):
 
 
 # ── Trae：pick_batch 轮签 ─────────────────────────────────────
+class TestTraePause(unittest.TestCase):
+    def test_pause_marker_skips_credential_load_and_is_not_success(self):
+        flag = os.path.join(tempfile.mkdtemp(prefix="trae-pause-test-"), ".signin-paused")
+        health = {"trae": {"consecutive_failures": 2, "last_success": "prior-success"}}
+        try:
+            with open(flag, "w", encoding="utf-8") as fh:
+                fh.write("synthetic test pause")
+            with mock.patch.object(run_all, "TRAE_SIGNIN_PAUSE_FILE", flag), \
+                 mock.patch.object(run_all, "load_trae_credential") as load_credential, \
+                 mock.patch.object(run_all, "load_health", return_value=health), \
+                 mock.patch.object(run_all, "save_health") as save_health, \
+                 mock.patch.object(run_all, "log"):
+                result = run_all.task_trae()
+            load_credential.assert_not_called()
+            save_health.assert_called_once_with(health)
+            self.assertEqual(result, (0, "PAUSED"))
+            self.assertEqual(health["trae"]["outcome"], run_all.OUTCOME_PAUSED)
+            self.assertTrue(health["trae"]["paused"])
+            self.assertEqual(health["trae"]["consecutive_failures"], 2)
+            self.assertEqual(health["trae"]["last_success"], "prior-success")
+        finally:
+            shutil.rmtree(os.path.dirname(flag), ignore_errors=True)
+
+
 class TestPickBatch(unittest.TestCase):
     def setUp(self):
         self.pend = [{"uid": str(i)} for i in range(5)]
@@ -531,7 +555,9 @@ class TestFetchCampaigns(unittest.TestCase):
     """fetch_campaigns -> (state, payload)；state ∈ OK/AUTH/HTTP/SCHEMA。"""
 
     def _fetch(self, api_ret):
-        with mock.patch.object(qoder_checkin, "_api", lambda *a, **k: api_ret):
+        with mock.patch.object(qoder_checkin, "_api", lambda *a, **k: api_ret), \
+                mock.patch.object(qoder_checkin.time, "sleep"), \
+                mock.patch.object(qoder_checkin, "log_line"):
             return qoder_checkin.fetch_campaigns("dt-x", "uid1")
 
     def test_top_level_campaigns(self):
@@ -555,6 +581,78 @@ class TestFetchCampaigns(unittest.TestCase):
     def test_500_is_http_state(self):
         state, _ = self._fetch((503, "boom"))
         self.assertEqual(state, "HTTP")
+
+    def test_ssl_eof_is_retried_then_campaigns_succeeds(self):
+        transient = qoder_checkin.urllib.error.URLError(
+            qoder_checkin.ssl.SSLEOFError(8, "unexpected EOF"))
+        api = mock.Mock(side_effect=[
+            transient,
+            (200, {"campaigns": [DAILY_100]}),
+        ])
+        with mock.patch.object(qoder_checkin, "_api", api), \
+                mock.patch.object(qoder_checkin.time, "sleep") as sleep, \
+                mock.patch.object(qoder_checkin, "log_line"):
+            state, payload = qoder_checkin.fetch_campaigns("dt-x", "uid1")
+        self.assertEqual(state, "OK")
+        self.assertEqual(len(payload["campaigns"]), 1)
+        self.assertEqual(api.call_count, 2)
+        self.assertEqual(api.call_args_list[0].args[1], "GET")
+        self.assertEqual(api.call_args_list[1].args[1], "GET")
+        sleep.assert_called_once_with(1.0)
+
+    def test_transient_network_retry_is_bounded_to_three_gets(self):
+        transient = qoder_checkin.urllib.error.URLError(
+            qoder_checkin.ssl.SSLEOFError(8, "unexpected EOF"))
+        api = mock.Mock(side_effect=[transient, transient, transient])
+        with mock.patch.object(qoder_checkin, "_api", api), \
+                mock.patch.object(qoder_checkin.time, "sleep") as sleep, \
+                mock.patch.object(qoder_checkin, "log_line"):
+            state, message = qoder_checkin.fetch_campaigns("dt-x", "uid1")
+        self.assertEqual(state, "HTTP")
+        self.assertIn("尝试 3 次", message)
+        self.assertEqual(api.call_count, 3)
+        self.assertEqual(
+            sleep.call_args_list,
+            [mock.call(1.0), mock.call(2.0)])
+
+    def test_http_503_is_retried_then_campaigns_succeeds(self):
+        api = mock.Mock(side_effect=[
+            (503, "temporarily unavailable"),
+            (200, {"campaigns": [DAILY_100]}),
+        ])
+        with mock.patch.object(qoder_checkin, "_api", api), \
+                mock.patch.object(qoder_checkin.time, "sleep") as sleep, \
+                mock.patch.object(qoder_checkin, "log_line"):
+            state, _ = qoder_checkin.fetch_campaigns("dt-x", "uid1")
+        self.assertEqual(state, "OK")
+        self.assertEqual(api.call_count, 2)
+        sleep.assert_called_once_with(1.0)
+
+    def test_401_is_never_retried(self):
+        api = mock.Mock(side_effect=[
+            (401, {"error": "unauthorized"}),
+            (200, {"campaigns": [DAILY_100]}),
+        ])
+        with mock.patch.object(qoder_checkin, "_api", api), \
+                mock.patch.object(qoder_checkin.time, "sleep") as sleep, \
+                mock.patch.object(qoder_checkin, "log_line"):
+            state, _ = qoder_checkin.fetch_campaigns("dt-x", "uid1")
+        self.assertEqual(state, "AUTH")
+        self.assertEqual(api.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_429_is_not_retried_immediately(self):
+        api = mock.Mock(side_effect=[
+            (429, {"error": "rate limited"}),
+            (200, {"campaigns": [DAILY_100]}),
+        ])
+        with mock.patch.object(qoder_checkin, "_api", api), \
+                mock.patch.object(qoder_checkin.time, "sleep") as sleep, \
+                mock.patch.object(qoder_checkin, "log_line"):
+            state, _ = qoder_checkin.fetch_campaigns("dt-x", "uid1")
+        self.assertEqual(state, "HTTP")
+        self.assertEqual(api.call_count, 1)
+        sleep.assert_not_called()
 
     def test_missing_campaigns_field_is_schema(self):
         state, _ = self._fetch((200, {"showCampaign": True}))
@@ -747,7 +845,87 @@ class TestQoderCampaignFlow(unittest.TestCase):
         self.assertEqual(res["result"], "SCHEMA_FAIL")
 
 
+class TestQoderLedgerRecording(unittest.TestCase):
+    def test_already_claimed_is_recorded_as_state_reverified(self):
+        result = {
+            "result": "ALREADY",
+            "campaign_id": "campaign-claimed-by-user",
+            "reward_credits": 100,
+        }
+        with mock.patch.object(qoder_checkin, "append_claim", return_value=True) as append:
+            created = qoder_checkin.record_confirmed_claim("synthetic-uid", result)
+        self.assertTrue(created)
+        append.assert_called_once_with(
+            "qoder-cn", "synthetic-uid", "qoder-cn-daily-personal",
+            "campaign-claimed-by-user", amount=100, evidence="state_reverified",
+            outcome="already")
+
+    def test_script_claim_uses_explicit_success_evidence(self):
+        result = {
+            "result": "OK",
+            "campaign_id": "campaign-script-claim",
+            "reward_credits": 100,
+        }
+        with mock.patch.object(qoder_checkin, "append_claim", return_value=True) as append:
+            qoder_checkin.record_confirmed_claim("synthetic-uid", result)
+        append.assert_called_once_with(
+            "qoder-cn", "synthetic-uid", "qoder-cn-daily-personal",
+            "campaign-script-claim", amount=100, evidence="explicit_success", outcome="claimed")
+
+    def test_failure_is_never_recorded(self):
+        with mock.patch.object(qoder_checkin, "append_claim") as append:
+            created = qoder_checkin.record_confirmed_claim(
+                "synthetic-uid", {"result": "CLAIM_FAIL", "campaign_id": "nope"})
+        self.assertFalse(created)
+        append.assert_not_called()
+
+
 # ── AES 已知向量（防手写密码学回归） ──────────────────────────
+class TestTraeLedgerRecording(unittest.TestCase):
+    def test_already_claimed_uses_state_reverified_evidence(self):
+        with mock.patch.object(trae_checkin, "append_claim", return_value=True) as append:
+            result = trae_checkin.record_confirmed_claim(
+                {"uid": "synthetic-trae-user"},
+                {"status": trae_checkin.STATUS_ALREADY, "reward_amount": 150})
+        self.assertTrue(result)
+        args, kwargs = append.call_args
+        self.assertEqual(args[:3], ("trae-cn", "synthetic-trae-user", "trae-cn-daily-free"))
+        self.assertEqual(kwargs["evidence"], "state_reverified")
+        self.assertEqual(kwargs["outcome"], "already")
+
+    def test_member_reward_amount_maps_to_member_rule(self):
+        with mock.patch.object(trae_checkin, "append_claim", return_value=True) as append:
+            trae_checkin.record_confirmed_claim(
+                {"uid": "synthetic-trae-user"},
+                {"status": trae_checkin.STATUS_SUCCESS, "reward_amount": 200})
+        self.assertEqual(append.call_args.args[2], "trae-cn-daily-member")
+
+    def test_cached_state_uses_local_state_evidence(self):
+        with mock.patch.object(trae_checkin, "append_claim", return_value=True) as append:
+            trae_checkin.record_confirmed_claim(
+                {"uid": "synthetic-trae-user"},
+                {"status": trae_checkin.STATUS_ALREADY}, evidence_override="local_state")
+        self.assertEqual(append.call_args.kwargs["evidence"], "local_state")
+        self.assertEqual(append.call_args.kwargs["outcome"], "already")
+
+    def test_ledger_warning_counts_as_incomplete(self):
+        result = _mk_result(trae_checkin.STATUS_SUCCESS)
+        result["ledger_warning"] = "synthetic failure"
+        summary = trae_checkin.summarize_results([result])
+        self.assertEqual(summary["ok"], 0)
+        self.assertEqual(summary["fail"], 1)
+        self.assertEqual(summary["exit"], 1)
+
+
+class TestUnfreezeCLI(unittest.TestCase):
+    def test_all_rejects_account_id_without_mutation(self):
+        with mock.patch.object(run_all, "unfreeze_accounts") as unfreeze, \
+             mock.patch("sys.argv", ["run_all.py", "--unfreeze", "all", "synthetic-user"]):
+            with self.assertRaises(SystemExit):
+                run_all.main()
+        unfreeze.assert_not_called()
+
+
 class TestAesVectors(unittest.TestCase):
     # NIST SP 800-38A F.2.1 CBC-AES128
     CBC_KEY = bytes.fromhex("2b7e151628aed2a6abf7158809cf4f3c")
@@ -817,7 +995,7 @@ class TestGbkPipeUtf8Guard(unittest.TestCase):
     复现方式：子进程设 PYTHONIOENCODING=gbk（等价于无控制台管道 + ACP=936）。
     通过当日"已签"状态文件构造零网络路径，无需任何真实凭据。"""
 
-    def _run_under_gbk(self, extra_env=None):
+    def _run_under_gbk(self, extra_env=None, state_payload=None):
         # 把 home/APPDATA 隔离到空临时目录：否则 find_storage_json() 会探测到
         # 本机真实 Trae 安装并加载真实账号，使"无凭据→exit1"路径不可达，
         # 测试随机器是否装 Trae 而漂移（曾在已装机上假绿/假红）。
@@ -830,6 +1008,14 @@ class TestGbkPipeUtf8Guard(unittest.TestCase):
             env["PYTHONIOENCODING"] = "gbk"
             for var in ("HOME", "USERPROFILE", "HOMEPATH", "APPDATA"):
                 env[var] = iso
+            env["LOCALAPPDATA"] = os.path.join(iso, "LocalAppData")
+            state_file = os.path.join(iso, "trae-state.json")
+            env["TRAE_STATE_FILE"] = state_file
+            env["TRAE_TOKEN_CACHE"] = os.path.join(iso, "LocalAppData", "AutoCheckin", "credentials", "trae-token-cache.dpapi")
+            env["TRAE_LEGACY_TOKEN_CACHE"] = os.path.join(iso, "no-legacy-cache.json")
+            if state_payload is not None:
+                with open(state_file, "w", encoding="utf-8") as fh:
+                    json.dump(state_payload, fh, ensure_ascii=False)
             env["HOMEDRIVE"] = (os.path.splitdrive(iso)[0] or "C:")
             env.update(extra_env or {})
             return subprocess.run(
@@ -842,26 +1028,14 @@ class TestGbkPipeUtf8Guard(unittest.TestCase):
     def test_stdout_emoji_survives_gbk_pipe(self):
         # D1 原始崩溃点：log_title/☑️/✅ 摘要全走 stdout
         key = "gbktest"
-        backup = None
-        if os.path.isfile(trae_checkin.STATE_FILE):
-            with open(trae_checkin.STATE_FILE, encoding="utf-8") as fh:
-                backup = fh.read()
-        try:
-            with open(trae_checkin.STATE_FILE, "w", encoding="utf-8") as fh:
-                json.dump({"date": trae_checkin.today_str(),
-                           "done": {key: {"status": "已签到", "credits": "-",
-                                          "at": "test"}},
-                           "cooldown": {}}, fh)
-            proc = self._run_under_gbk({
-                "TRAE_UID": key, "TRAE_ACCESS_TOKEN": "dummy",
-                "TRAE_JITTER": "0"})
-        finally:
-            if backup is None:
-                if os.path.isfile(trae_checkin.STATE_FILE):
-                    os.remove(trae_checkin.STATE_FILE)
-            else:
-                with open(trae_checkin.STATE_FILE, "w", encoding="utf-8") as fh:
-                    fh.write(backup)
+        proc = self._run_under_gbk({
+            "TRAE_UID": key, "TRAE_ACCESS_TOKEN": "dummy",
+            "TRAE_JITTER": "0"},
+            state_payload={
+                "date": trae_checkin.today_str(),
+                "done": {key: {"status": "已签到", "credits": "-", "at": "test"}},
+                "cooldown": {},
+            })
         out = proc.stdout.decode("utf-8", "replace")
         self.assertEqual(proc.returncode, 0)
         self.assertIn("账号数量", out)          # log_title 正常渲染（非乱码/崩溃）

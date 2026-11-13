@@ -331,5 +331,30 @@ class HelperTests(unittest.TestCase):
             self.assertEqual(kwargs["creationflags"], subprocess.CREATE_NO_WINDOW)
 
 
+class LedgerTests(unittest.TestCase):
+    def test_claimed_uses_explicit_success_evidence(self):
+        result = {"result": "CLAIMED", "credit": 100}
+        with patch.object(signin, "append_claim", return_value=True) as append:
+            self.assertTrue(signin._record_daily_claim("synthetic-user", result))
+        args, kwargs = append.call_args
+        self.assertEqual(args[:3], ("workbuddy-cn", "synthetic-user", "workbuddy-cn-daily-checkin"))
+        self.assertRegex(args[3], r"^\d{4}-\d{2}-\d{2}$")
+        self.assertEqual(kwargs, {"amount": 100, "evidence": "explicit_success", "outcome": "claimed"})
+
+    def test_already_uses_state_reverified_evidence(self):
+        result = {"result": "ALREADY", "today_credit": 200}
+        with patch.object(signin, "append_claim", return_value=True) as append:
+            self.assertTrue(signin._record_daily_claim("synthetic-user", result))
+        self.assertEqual(append.call_args.kwargs["amount"], 200)
+        self.assertEqual(append.call_args.kwargs["evidence"], "state_reverified")
+        self.assertEqual(append.call_args.kwargs["outcome"], "already")
+
+    def test_ledger_write_failure_is_reported(self):
+        result = {"result": "ALREADY"}
+        with patch.object(signin, "append_claim", side_effect=OSError("synthetic failure")):
+            self.assertFalse(signin._record_daily_claim("synthetic-user", result))
+        self.assertIn("ledger_warning", result)
+
+
 if __name__ == "__main__":
     unittest.main()

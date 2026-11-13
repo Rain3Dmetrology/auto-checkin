@@ -65,10 +65,10 @@ run_all.py（计划任务统一入口，pythonw.exe 静默运行）
  │        （兼容新版桌面端加密凭据；仅调用本机 WorkBuddy runtime 解密，不输出令牌）
  ├─ trae\trae_checkin.py            Trae 签到（抗 9074 限流）
  │   └─ 凭据: run_all 自动解密 %APPDATA%\TRAE SOLO CN\...\storage.json
- │        （纯标准库 AES 解出 refreshToken，经环境变量传递，不落盘）
+ │        （纯标准库 AES 解密；续期后的 Token 仅写入仓库外 DPAPI 缓存）
  └─ qoder\qoder_checkin.py          Qoder CN 签到
      └─ 凭据: DPAPI 解密 %APPDATA%\com.qodercn.app.stable\auth.v1.dat
-          （dt- token 过期时自动用 drt- 续期，缓存在 qoder\state.json）
+          （dt- token 过期时自动用 drt- 续期，缓存在仓库外 DPAPI 凭据目录）
 ```
 
 三个子任务互相隔离：任何一个失败/未安装不影响其余两个。今日已签到的软件
@@ -190,5 +190,25 @@ powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
 凭据安全：全程只读本机凭据文件，不回写官方客户端数据、不上传、日志与输出
 中不含任何令牌。
 
-风险声明：签到接口均逆向自各官方客户端，服务端改版可能导致失效；失效后请
-关注上述上游仓库获取更新（signin.py 与 trae_checkin.py 可直接替换新版）。
+风险声明：签到接口来自官方客户端分析，服务端改版可能导致失效；上游更新请先审查和验证，再择优移植，避免覆盖本仓库的安全存储、冻结和账本逻辑。
+
+
+## P0 安全存储与账号冻结
+
+Windows 上 Qoder 和 TRAE 的续期 Token 缓存存放在仓库外的 `%LOCALAPPDATA%\\AutoCheckin\\credentials`，使用当前 Windows 用户 DPAPI 加密，并限制目录/文件 ACL。首次运行会将旧的仓库内明文缓存迁移到安全位置；仅在加密写入和读回验证成功后才删除旧文件。迁移失败会保留原文件并停止使用该缓存，不降级为明文。非 Windows 平台目前使用 0700 目录与 0600 文件权限保护，未提供静态加密。
+
+账号遭遇服务端明确的认证拒绝后会被持久冻结，避免计划任务每小时反复请求。限流和网络故障不会冻结账号。重新登录对应桌面客户端后，使用：
+
+```powershell
+python .\\run_all.py --list-frozen
+python .\\run_all.py --unfreeze trae
+```
+
+解除范围可指定 `workbuddy`、`trae`、`qoder` 或 `all`；平台解除会清除该平台所有冻结条目。
+
+## P1 奖励规则与执行账本
+
+- `data/reward-rules.json` 是描述性规则注册表，区分官方核实、第三方核实、待确认；不驱动 API 请求。
+- `%LOCALAPPDATA%\AutoCheckin\ledger\claims.jsonl` 仅保存已确认的领取或已领取状态；账号指纹由本机专用 HMAC 密钥生成（Windows 上密钥受 DPAPI 保护），不保存原始 UID、Token 或完整 HTTP 响应。
+- 新领取记为 `claimed`，平台确认早已领取记为 `already`；台账按账号、规则和日窗口幂等去重，不会把已领取重计为新奖励。
+- 运行测试：`python -m compileall -q .` 和 `python -m unittest discover -s tests -p "test*.py" -v`。

@@ -50,6 +50,12 @@ import urllib.parse
 import uuid
 from datetime import datetime
 
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+from account_controls import freeze_account, is_frozen
+from execution_ledger import append_claim
+
 DEFAULT_ENDPOINT = "https://copilot.tencent.com"
 AUTH_BASENAME = os.path.join("CodeBuddyExtension", "Data", "Public", "auth", "workbuddy-desktop.info")
 # Linux 没有桌面端，入口是 CodeBuddy CLI；它写出的凭据文件名不同、放在 XDG 数据目录
@@ -1545,6 +1551,31 @@ def main():
         return 2
 
 
+def _record_daily_claim(account_uid, result):
+    if not isinstance(result, dict) or result.get("result") not in {"CLAIMED", "ALREADY"}:
+        return True
+    if not account_uid:
+        result["ledger_warning"] = "confirmed check-in has no stable account id"
+        return False
+    amount = result.get("credit")
+    if amount is None:
+        amount = result.get("today_credit")
+    if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+        amount = None
+    evidence = "state_reverified" if result.get("result") == "ALREADY" else "explicit_success"
+    try:
+        append_claim(
+            "workbuddy-cn", account_uid, "workbuddy-cn-daily-checkin",
+            time.strftime("%Y-%m-%d", time.gmtime(time.time() + 8 * 3600)),
+            amount=amount, evidence=evidence,
+            outcome="already" if result.get("result") == "ALREADY" else "claimed"
+        )
+    except Exception as exc:
+        result["ledger_warning"] = "ledger write failed (%s)" % type(exc).__name__
+        return False
+    return True
+
+
 def _run(action):
     _start_budget(action)
     known = ("auto", "silent", "growth", "silent-poll", "silent-growth", "status", "claim", "all", "doctor")
@@ -1592,6 +1623,12 @@ def _run(action):
             emit(run_doctor(session), action)
             return 0
         session = resolve_session(session)
+        account_uid = str(((session.get("account") or {}).get("uid") or "")).strip()
+        if action != "doctor" and account_uid and is_frozen("workbuddy", account_uid):
+            emit({"result": "FROZEN",
+                  "report": "该账号此前遭遇明确鉴权拒绝，已暂停上游请求；重新登录后执行 python run_all.py --unfreeze workbuddy",
+                  "needs_attention": True}, action)
+            return 1
         headers = build_headers(session)
     except AuthError as e:
         emit(e.output(), action)
@@ -1601,6 +1638,13 @@ def _run(action):
 
     if action in ("auto", "silent"):
         code, out, _ = run_daily(headers, endpoint)
+        if not _record_daily_claim(account_uid, out):
+            code = 1
+        if account_uid and (out.get("result") == "AUTH_REJECTED"
+                            or out.get("growth_result") == "AUTH_REJECTED"):
+            freeze_account("workbuddy", account_uid, "AUTH_REJECTED")
+            out["account_frozen"] = True
+            out["report"] = (str(out.get("report") or "") + "；已冻结账号，请重新登录后手动解除冻结").strip("；")
         emit(out, action)
         return code
 
@@ -1613,8 +1657,15 @@ def _run(action):
         # 空跑默认不落盘——一天要跑好几轮，全写进去只会把真正有价值的记录
         # 淹没在一串"Buddy 旅行中"里。要看完整过程就设 WORKBUDDY_GROWTH_LOG_EMPTY=1。
         code, out, quiet = run_daily(headers, endpoint)
+        if not _record_daily_claim(account_uid, out):
+            code = 1
+        if account_uid and (out.get("result") == "AUTH_REJECTED"
+                            or out.get("growth_result") == "AUTH_REJECTED"):
+            freeze_account("workbuddy", account_uid, "AUTH_REJECTED")
+            out["account_frozen"] = True
+            out["report"] = (str(out.get("report") or "") + "；已冻结账号，请重新登录后手动解除冻结").strip("；")
         out["trigger"] = "poll"
-        if (not quiet) or _env_flag("WORKBUDDY_GROWTH_LOG_EMPTY"):
+        if (not quiet) or _env_flag("WORKBUDDY_GROWTH_LOG_EMPTY") or out.get("ledger_warning"):
             emit(out, action)
         return code
 

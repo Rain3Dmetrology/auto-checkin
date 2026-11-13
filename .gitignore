@@ -7,3 +7,14 @@ logs/
 qoder/state.json
 trae/.trae_checkin_state.json
 trae/.trae_token_cache.json
+*.dpapi
+*.tmp-*
+trae/.signin-paused
+trae/.trae_device_ids.json
+# Local credentials and account-claim records
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+claims.jsonl

@@ -11,8 +11,8 @@
      -> os_crypt.encrypted_key -> 剥 "DPAPI" 前缀 -> DPAPI 解出 32 字节 AES key
   2. 读同目录 auth.v1.dat（Electron os_crypt v10 布局）
      -> AES-256-GCM 解出 {token(dt-), refreshToken(drt-), expiresAt, user{...}}
-  3. dt- 过期时用 drt- 调 deviceToken/refresh 换新（结果缓存在本目录
-     state.json，绝不回写 auth.v1.dat，不影响桌面客户端）
+  3. dt- 过期时用 drt- 调 deviceToken/refresh 换新（结果缓存到仓库外的
+     %LOCALAPPDATA%\\AutoCheckin\\credentials，以当前 Windows 用户 DPAPI 加密）
   4. GET  /sash/api/v1/me/campaigns   官方活动领取接口（每日 10:00→次日 10:00 分窗）
      必须带 Cosy-ClientType:10 头，否则服务端返回空 campaigns（实测 2026-09-21）。
      从返回的活动列表里严格筛出"每日 100 Credits"目标活动：
@@ -51,6 +51,14 @@ import urllib.parse
 import urllib.request
 import uuid
 
+# 共享凭据存储位于仓库外；Windows 使用当前用户 DPAPI。
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+from secure_store import credential_dir, read_json_with_migration, write_secure_json
+from account_controls import freeze_account, is_frozen
+from execution_ledger import append_claim
+
 # ---------------------------------------------------------------------------
 # 常量（逆向自 Qoder CN 官方桌面客户端）
 # ---------------------------------------------------------------------------
@@ -68,6 +76,10 @@ COSY_VERSION = os.environ.get("QODER_COSY_VERSION", "0.3.4")
 CAMPAIGN_UA = "Qoder"
 CAMPAIGN_REFERER = "https://openapi.qoder.com.cn/growth-page/activity-iframe"
 DAILY_BENEFIT_AMOUNT = 100      # 每日活动固定 100 Credits（用于严格区分其它活动）
+# campaigns 是幂等 GET：仅对瞬时网络/TLS 和 408/5xx 有界重试；绝不重试 401/403、429 或 claim POST。
+CAMPAIGNS_GET_MAX_ATTEMPTS = 3
+CAMPAIGNS_GET_RETRY_DELAYS = (1.0, 2.0)
+CAMPAIGNS_GET_RETRY_HTTP_STATUSES = {408, 500, 502, 503, 504}
 
 
 def claim_path(campaign_id):
@@ -77,10 +89,18 @@ def claim_path(campaign_id):
         str(campaign_id), safe="")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-STATE_FILE = os.path.join(HERE, "state.json")
+CREDENTIAL_DIR = credential_dir()
+STATE_FILE = os.path.join(CREDENTIAL_DIR, "qoder-token-cache.dpapi")
+LEGACY_STATE_FILE = os.path.join(HERE, "state.json")
 LOG_FILE = os.path.join(HERE, "checkin.log")
 
 EXIT_OK, EXIT_AUTH, EXIT_TOKEN, EXIT_FAIL = 0, 2, 3, 4
+
+
+class AccountFrozenError(RuntimeError):
+    """Raised before provider I/O when this account is frozen."""
+_REFRESH_AUTH_REJECTED = False
+_LAST_REFRESH_UID = ""
 
 
 def app_data_dir():
@@ -318,21 +338,17 @@ def load_app_auth():
 
 
 def load_state():
-    try:
-        with open(STATE_FILE, encoding="utf-8") as fh:
-            d = json.load(fh)
-        return d if isinstance(d, dict) else {}
-    except Exception:
-        return {}
+    # 损坏/无法解密时 fail-closed，不能静默回退到旧 Token。
+    return read_json_with_migration(STATE_FILE, [LEGACY_STATE_FILE])
 
 
 def save_state(token, refresh, expires_at):
-    tmp = STATE_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump({"accessToken": token, "refreshToken": refresh,
-                   "expiresAt": expires_at, "updatedAt": int(time.time())},
-                  fh, ensure_ascii=False, indent=2)
-    os.replace(tmp, STATE_FILE)
+    write_secure_json(STATE_FILE, {
+        "accessToken": token,
+        "refreshToken": refresh,
+        "expiresAt": expires_at,
+        "updatedAt": int(time.time()),
+    })
 
 
 def pick_credential():
@@ -367,6 +383,8 @@ def pick_credential():
 
 def refresh_token_pair(refresh_token):
     """用 drt- 换新 dt-。返回 (token, refresh, expiresAt) 或 None。"""
+    global _REFRESH_AUTH_REJECTED
+    _REFRESH_AUTH_REJECTED = False
     if not refresh_token:
         return None
     payload = json.dumps({"refresh_token": refresh_token}).encode("utf-8")
@@ -379,6 +397,10 @@ def refresh_token_pair(refresh_token):
         try:
             with urllib.request.urlopen(req, timeout=20) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                _REFRESH_AUTH_REJECTED = True
+            continue
         except Exception:
             continue
         token = str(data.get("token") or data.get("device_token") or "")
@@ -395,7 +417,11 @@ def refresh_token_pair(refresh_token):
 
 def ensure_token():
     """拿到可用 token；必要时自动续期。失败抛异常。"""
+    global _LAST_REFRESH_UID
     token, refresh, exp, uid, nickname, user = pick_credential()
+    _LAST_REFRESH_UID = uid
+    if is_frozen("qoder", uid):
+        raise AccountFrozenError("account is frozen; refresh is blocked")
     if token and exp > time.time() + 60:
         return token, refresh, uid, nickname
     print("[qoder] dt- token 已过期，尝试用 refreshToken 续期 ...")
@@ -404,7 +430,7 @@ def ensure_token():
         raise RuntimeError("续期失败（refreshToken 也失效）。请打开一次 Qoder CN 重新登录。")
     token, refresh, exp = got
     save_state(token, refresh, exp)
-    print("[qoder] 续期成功，已缓存到 state.json")
+    print("[qoder] 续期成功，已写入仓库外 DPAPI 凭据缓存")
     return token, refresh, uid, nickname
 
 
@@ -516,28 +542,83 @@ def find_target_campaign(campaigns):
     return sorted(matches, key=rank, reverse=True)[0]
 
 
+def _is_retryable_campaign_network_error(exc):
+    """仅识别瞬时网络/TLS错误；认证、解析和程序错误不重试。"""
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    return isinstance(
+        reason,
+        (ssl.SSLError, TimeoutError, ConnectionError, OSError),
+    )
+
+
 def fetch_campaigns(token, uid):
-    """GET campaigns。返回 (state, payload)：
+    """GET campaigns。GET 可安全重试；领取 POST 不经过此重试路径。
+
+    返回 (state, payload)：
       state=OK     payload 为含 campaigns 列表的 dict
       state=AUTH   401/403，token 被拒（payload=None）
       state=HTTP   其它 4xx/5xx 或网络错误（payload 为错误串）
       state=SCHEMA 200 但结构异常/疑似改版（payload 为说明串）
+
+    对 SSL EOF、DNS/连接/超时等瞬时网络错误及 408/5xx 最多尝试 3 次。
+    401/403 不重试，429 不立即重试（交由后续计划任务冷却补偿）。
     """
-    try:
-        status, body = _api(PATH_CAMPAIGNS, "GET", token, uid)
-    except Exception as exc:
-        return "HTTP", "请求失败：%r" % (exc,)
-    if status in (401, 403):
-        return "AUTH", None
-    if status >= 400:
-        return "HTTP", "HTTP %d %s" % (status, str(body)[:160])
-    try:
-        data = normalize_body(body)
-    except ValueError as exc:
-        return "SCHEMA", str(exc)[:160]
-    if not isinstance(data.get("campaigns"), list):
-        return "SCHEMA", "campaigns 字段缺失或非列表（疑似 API 改版）"
-    return "OK", data
+    last_error = ""
+    for attempt in range(CAMPAIGNS_GET_MAX_ATTEMPTS):
+        try:
+            status, body = _api(PATH_CAMPAIGNS, "GET", token, uid)
+        except Exception as exc:
+            if (_is_retryable_campaign_network_error(exc)
+                    and attempt + 1 < CAMPAIGNS_GET_MAX_ATTEMPTS):
+                delay = CAMPAIGNS_GET_RETRY_DELAYS[
+                    min(attempt, len(CAMPAIGNS_GET_RETRY_DELAYS) - 1)]
+                log_line({
+                    "cmd": "campaigns_get",
+                    "result": "RETRYING",
+                    "attempt": attempt + 1,
+                    "error_class": type(exc.reason if isinstance(
+                        exc, urllib.error.URLError) else exc).__name__,
+                    "delay_seconds": delay,
+                })
+                time.sleep(delay)
+                continue
+            return "HTTP", "请求失败（campaigns GET 尝试 %d 次）：%r" % (
+                attempt + 1, exc)
+
+        if status in (401, 403):
+            return "AUTH", None
+        if status >= 400:
+            last_error = "HTTP %d %s" % (status, str(body)[:160])
+            if (status in CAMPAIGNS_GET_RETRY_HTTP_STATUSES
+                    and attempt + 1 < CAMPAIGNS_GET_MAX_ATTEMPTS):
+                delay = CAMPAIGNS_GET_RETRY_DELAYS[
+                    min(attempt, len(CAMPAIGNS_GET_RETRY_DELAYS) - 1)]
+                log_line({
+                    "cmd": "campaigns_get",
+                    "result": "RETRYING",
+                    "attempt": attempt + 1,
+                    "error_class": "HTTP_%d" % status,
+                    "delay_seconds": delay,
+                })
+                time.sleep(delay)
+                continue
+            return "HTTP", last_error
+
+        try:
+            data = normalize_body(body)
+        except ValueError as exc:
+            return "SCHEMA", str(exc)[:160]
+        if not isinstance(data.get("campaigns"), list):
+            return "SCHEMA", "campaigns 字段缺失或非列表（疑似 API 改版）"
+        if attempt:
+            log_line({
+                "cmd": "campaigns_get",
+                "result": "RETRY_SUCCEEDED",
+                "attempts": attempt + 1,
+            })
+        return "OK", data
+
+    return "HTTP", last_error or "campaigns GET 重试耗尽"
 
 
 def _claim_succeeded(body):
@@ -694,6 +775,30 @@ def campaigns_summary(token, uid):
     }
 
 
+def record_confirmed_claim(uid, result):
+    """将服务端明确确认的每日奖励写入幂等账本。
+
+    OK 表示本脚本收到明确领取成功；ALREADY 表示服务端 campaigns 状态
+    已确认领取（可能由桌面端/用户手动完成）。两者都记录一次，ALREADY
+    使用 state_reverified；同一 campaignId 的重复调度由账本 event_id 去重。
+    """
+    outcome = result.get("result") if isinstance(result, dict) else None
+    if outcome not in {"OK", "ALREADY"}:
+        return False
+    evidence = (
+        "state_reverified"
+        if outcome == "ALREADY" or result.get("verified") or result.get("recovered")
+        else "explicit_success"
+    )
+    return append_claim(
+        "qoder-cn", uid, "qoder-cn-daily-personal",
+        str(result.get("campaign_id") or time.strftime("%Y-%m-%d")),
+        amount=result.get("reward_credits"),
+        evidence=evidence,
+        outcome="already" if outcome == "ALREADY" else "claimed",
+    )
+
+
 def log_line(entry):
     line = json.dumps({"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "app": "qoder",
                        **entry}, ensure_ascii=False)
@@ -716,21 +821,45 @@ def main():
 
     try:
         token, refresh, uid, nickname = ensure_token()
+    except AccountFrozenError:
+        log_line({"cmd": cmd, "result": "FROZEN"})
+        sys.exit(EXIT_TOKEN)
     except Exception as exc:
+        if _REFRESH_AUTH_REJECTED and _LAST_REFRESH_UID:
+            freeze_account("qoder", _LAST_REFRESH_UID, "AUTH_REJECTED")
         log_line({"cmd": cmd, "result": "AUTH_FAIL", "error": str(exc)[:200]})
         sys.exit(EXIT_AUTH)
 
+
     if cmd == "status":
         ok, summary = campaigns_summary(token, uid)
+        if not ok and summary.get("state") == "AUTH":
+            freeze_account("qoder", uid, "AUTH_REJECTED")
         if as_json:
             log_line({"cmd": cmd, "result": "OK" if ok else "FAIL",
                       "status": summary if ok else None,
                       "error": None if ok else summary})
         else:
             print(json.dumps(summary, ensure_ascii=False, indent=2))
+        if not ok and summary.get("state") == "AUTH":
+            sys.exit(EXIT_TOKEN)
         sys.exit(EXIT_OK if ok else EXIT_FAIL)
 
     code, result = do_checkin(token, uid)
+    if code == EXIT_TOKEN and result.get("result") == "AUTH_FAIL":
+        freeze_account("qoder", uid, "AUTH_REJECTED")
+    if code == EXIT_OK and result.get("result") in {"OK", "ALREADY"}:
+        try:
+            created = record_confirmed_claim(uid, result)
+            if created:
+                log_line({"cmd": "ledger", "result": "RECORDED",
+                          "evidence": "state_reverified" if result.get("result") == "ALREADY"
+                          else ("state_reverified" if result.get("verified") or result.get("recovered")
+                                else "explicit_success")})
+        except Exception as exc:
+            log_line({"cmd": "ledger", "result": "WRITE_FAILED", "error": type(exc).__name__})
+            result["ledger_warning"] = "ledger write failed (%s)" % type(exc).__name__
+            code = EXIT_FAIL
     if as_json:
         log_line({"cmd": cmd, "uid": uid[:8] if uid else "",
                   "nickname": nickname, **result})

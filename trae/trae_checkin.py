@@ -9,11 +9,11 @@ Trae AutoCheckin · Trae 每日自动签到（抗 9074 限流版）
 ✨ 特性
   • 零依赖     仅用 Python 标准库，无需 pip 安装（解密桌面端凭据时才需 cryptography）
   • Token 缓存 复用未过期的 accessToken，失效才用 refreshToken 续期
-  • 链式续期   refreshToken 会轮换，脚本自动回写最新值，长期不失效
+  • 链式续期   refreshToken 会轮换，最新值仅写入仓库外 DPAPI/受限权限缓存
   • 多账号     TRAE_ACCOUNTS(JSON) / TRAE_REFRESH_TOKEN[_N] / 桌面端凭据 三种配法均可
   • 自动解密   直接读 Trae 客户端 storage.json，免抓包免手抄 token
   • 稳定设备   按账号生成固定 16 位设备号并持久化，跨运行不漂移
-  • 一轮全签   默认每轮把所有未签账号全签掉，9074 自动换号兜底
+  • 一轮全签   默认每轮把所有未签账号全签掉，9074 冷却后由下轮计划任务补跑
   • 抗 9074    请求体带 req_source + 设备头（与客户端同款，缺了会被拒成 9074）
   • 失败让路   本轮没签成的交给下一轮 cron 补签，不硬轰、不拖其它账号下水
   • 积分余额   签到后用 entitlement 接口查真实余额，推送里直接给数字
@@ -27,14 +27,14 @@ Trae AutoCheckin · Trae 每日自动签到（抗 9074 限流版）
     （想恢复旧行为一个被限就全体收工，设 TRAE_CIRCUIT=1）
   • 当日状态文件 .trae_checkin_state.json —— 已签成功的账号后续运行零请求
   • HTTP 429/5xx 与 code=9074 同等对待；账号间真发过 claim 才错峰 12~25s
-  • 9074 反复出现 = 设备号被服务端记住，自动换新设备号立刻重签（实测有效）
-  • 换号后仍 9074 才按账号记冷却（早窗 12 分钟 / 平时 55 分钟），冷却内零请求
+  • 9074 表示服务端限流/排队：记录账号冷却，不轮换设备标识，不在本轮换号重试
+  • 9074 / HTTP 429 / 5xx 按账号记冷却（早窗 12 分钟 / 平时 55 分钟），冷却内零请求
   • 早窗(TRAE_PEAK_HOURS，默认 0 点)自动一轮全签，其余时段每小时轮 1 个
   • 实测结论：换设备号 / 换出口 IP / 换请求头 都绕不开 9074（服务端按"当前
     参与用户太多"做容量门），凌晨 0 点前后最容易签成，所以 cron 建议放在 00:23
   • 实测 00:00~00:10 是全天最高峰（整点所有人一起签），cron 别用 0 分；
     本脚本启动后再随机抖 0~20s，避免同一定时任务的多个部署互相撞车
-  • 设备号优先用客户端真实号（storage.json 的 iCubeAuthInfo://icube-dc 键），拿不到才生成
+  • 设备号优先用客户端真实号（storage.json 的 iCubeAuthInfo://icube-dc 键）；无真实号时沿用稳定本机标识
 
 📦 环境变量
   TRAE_ACCOUNTS            多账号 JSON 数组（推荐），字段见下
@@ -50,13 +50,13 @@ Trae AutoCheckin · Trae 每日自动签到（抗 9074 限流版）
   TRAE_PEAK_HOURS          早窗小时（可选，默认 0；支持 0 / 0,23 / 0-1）
   TRAE_PEAK_COOLDOWN_MIN   早窗内冷却分钟数（可选，默认 12）
   TRAE_CIRCUIT             设 1 恢复旧熔断：一个账号 9074 就全体收工（默认关）
-  TRAE_ROTATE              9074 后自动换新设备号（可选，默认开；设 0 关闭）
+  （已移除）9074 后自动换设备号；限流只记冷却并交给下轮任务
   TRAE_DEVICE_BRAND        设备品牌请求头（可选，默认不发，对应桌面端 device_model）
   TRAE_UID[_N]             账号标识（可选，仅用于日志）
   TRAE_ONLY                只跑指定账号：序号 / uid / 名字（可选）
-  CLAIM_TRIES              单轮 claim 重试次数（可选，默认 1，调大反而更容易被限）
-  TRAE_TOKEN_CACHE         token 缓存文件路径（可选，默认 /ql/data/config/ 或脚本同目录）
-  TRAE_ACCOUNT_DIR         账号 JSON 所在目录（可选，用于回写轮换后的 refreshToken）
+  （已固定）每账号每轮最多一次 claim；只有明确鉴权拒绝且续期成功才允许再发一次
+  TRAE_TOKEN_CACHE         token 缓存文件路径（可选；Windows 默认 %LOCALAPPDATA%\\AutoCheckin\\credentials，缓存自动加密）
+  TRAE_ACCOUNT_DIR         已弃用；不再向普通账号 JSON 回写 refreshToken
   QYWX_TOKEN               企业微信群机器人 Webhook key（可选，也兼容 WECHAT_WEBHOOK）
   PLUSPLUS_TOKEN           PushPlus token（可选）
 
@@ -77,7 +77,7 @@ Trae AutoCheckin · Trae 每日自动签到（抗 9074 限流版）
      积分查询另用 trae_credit_monitor.py
 
 🎛 运行模式
-  一轮全签（默认）   不设 TRAE_BATCH，把所有未签账号一轮签完（9074 自动换号兜底）
+  一轮全签（默认）   不设 TRAE_BATCH，把所有未签账号一轮签完（9074 冷却后下轮补跑）
   按小时轮签         TRAE_BATCH=1 每轮只签 1 个账号，按北京时间小时轮换
   手动指定           TRAE_ONLY=3 只签第 3 个；也可填 uid 或 name
   当日去重           已签成功的账号当天不再请求接口，重复触发定时任务不浪费额度
@@ -85,13 +85,20 @@ Trae AutoCheckin · Trae 每日自动签到（抗 9074 限流版）
 📌 特别说明
   • 签接口按"设备号"维度判断今日是否已签；实测用模拟的 16 位数字即可签到成功，
     服务端不校验设备号是否真实注册。
-  • refreshToken 是轮换链：每次续期都会产生新值，脚本会写回缓存与账号文件，
-    请勿在多处同时使用同一账号，否则会互相使对方 token 失效。
-  • 只有"refreshToken 也续期失败"才算硬失败；限流等软失败会照常推送结果。
+  • refreshToken 是轮换链：每次续期产生新值，只写入仓库外的安全缓存；不要在多处
+    同时使用同一账号，否则会互相使对方 token 失效。
+  • 确认的鉴权拒绝会冻结该账号；网络异常/限流不冻结，且不重复发送领取 POST。
 ────────────────────────────────────────────────────────────
 """
 
-import base64, glob, hashlib, json, os, platform, random, sys, time, urllib.request, urllib.error
+import base64, hashlib, json, os, platform, random, re, sys, time, urllib.request, urllib.error
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+from secure_store import credential_dir, read_json_with_migration, write_secure_json
+from account_controls import freeze_account, is_frozen
+from execution_ledger import append_claim
 
 UgHost = 'https://api.trae.cn'
 OAuthHost = 'https://api.trae.com.cn'
@@ -117,10 +124,11 @@ QYWX_TOKEN = os.getenv('QYWX_TOKEN') or os.getenv('WECHAT_WEBHOOK') or ''
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEVICE_ID_FILE = os.path.join(HERE, '.trae_device_ids.json')
-STATE_FILE = os.path.join(HERE, '.trae_checkin_state.json')
-# 刷新后的 token 缓存：Trae 每次续期都会轮换 refreshToken，青龙里
-# TRAE_ACCOUNTS 是静态的，必须靠本文件记住最新的 token 对，否则会越刷越失效。
-TOKEN_CACHE_FILE = os.path.join(HERE, '.trae_token_cache.json')
+STATE_FILE = os.environ.get('TRAE_STATE_FILE', os.path.join(HERE, '.trae_checkin_state.json'))
+# 刷新后的 Token 轮换缓存移出 Git 工作区；Windows 由 DPAPI 加密。
+CREDENTIAL_DIR = credential_dir()
+TOKEN_CACHE_FILE = os.path.join(CREDENTIAL_DIR, 'trae-token-cache.dpapi')
+LEGACY_TOKEN_CACHE_FILE = os.path.join(HERE, '.trae_token_cache.json')
 
 
 # ══════════════════ tc 解密（仅读桌面端凭据时用得到） ══════════════════
@@ -231,14 +239,28 @@ def load_from_storage(storage_path):
 
 # ══════════════════ 缓存文件 ══════════════════
 def _cache_path():
+    # 显式路径继续受支持，但文件内容仍必须使用安全存储格式。
     p = os.environ.get('TRAE_TOKEN_CACHE', '').strip()
     if p:
         return p
-    for cand in ('/ql/data/config/.trae_token_cache.json', TOKEN_CACHE_FILE):
-        d = os.path.dirname(cand)
-        if d and os.path.isdir(d):
-            return cand
+    if os.name != 'nt':
+        ql = '/ql/data/config/.trae_token_cache.json'
+        if os.path.isdir(os.path.dirname(ql)):
+            return ql
     return TOKEN_CACHE_FILE
+
+
+def _legacy_cache_paths():
+    # Explicit override is also the test-isolation seam: a child process must
+    # never migrate a developer's real repo cache while running in a temp HOME.
+    override = os.environ.get('TRAE_LEGACY_TOKEN_CACHE', '').strip()
+    if override:
+        return [override]
+    paths = [LEGACY_TOKEN_CACHE_FILE]
+    ql = '/ql/data/config/.trae_token_cache.json'
+    if os.path.isfile(ql):
+        paths.append(ql)
+    return paths
 
 
 def _harden_credentials(path):
@@ -267,19 +289,13 @@ def atomic_write_json(path, data):
 
 
 def load_cache():
-    try:
-        with open(_cache_path(), 'r', encoding='utf-8') as fh:
-            d = json.load(fh)
-        return d if isinstance(d, dict) else {}
-    except Exception:
-        return {}
+    # 加密缓存损坏或 DPAPI 不可用时必须显式失败，不能静默改用旧 refreshToken。
+    return read_json_with_migration(_cache_path(), _legacy_cache_paths())
 
 
 def save_cache(cache):
-    try:
-        atomic_write_json(_cache_path(), cache)
-    except Exception as e:
-        print('⚠️  [缓存] 写入失败:', e)
+    # 轮换链必须持久化成功；写入失败时中止本轮，避免下次拿旧 refreshToken。
+    write_secure_json(_cache_path(), cache)
 
 
 def put_cache(cache, acc):
@@ -495,8 +511,13 @@ def _jwt_exp(token):
         return 0
 
 
+def _refresh_was_rejected(message):
+    text = str(message or "").lower()
+    return bool(re.search(r"refresh http=(401|403)\b|invalid_grant|invalid refresh token", text))
+
+
 def ensure_token(acc, cache):
-    """accessToken 缺失时直接续期；返回 (ok, msg)。续期成功即回写缓存与账号文件。"""
+    """accessToken 缺失时直接续期；返回 (ok, msg)。续期成功即写入 DPAPI 缓存。"""
     if not acc.get('refreshToken'):
         return False, '无 refreshToken，无法刷新'
     new_at, new_rt, msg = refresh(acc['refreshToken'])
@@ -506,36 +527,11 @@ def ensure_token(acc, cache):
     if new_rt:
         acc['refreshToken'] = new_rt
     put_cache(cache, acc)
-    persist_tokens(acc)
-    return True, '已刷新 accessToken'
+    return True, '已刷新 accessToken；已写入 DPAPI/受限权限缓存'
 
 
-def persist_tokens(acc):
-    """若本机存有该账号的凭据文件 trae-<uid>*.json，把续期结果写回去。
-    目录可用 TRAE_ACCOUNT_DIR 指定，默认取脚本所在目录（青龙下通常没有该文件，
-    静默跳过即可，token 仍会保存在 .trae_token_cache.json 里）。"""
-    uid = str(acc.get('uid', '') or '').strip()
-    if not uid:
-        return
-    files = []
-    for d in [os.getenv('TRAE_ACCOUNT_DIR', '').strip(), HERE]:
-        if d and os.path.isdir(d):
-            files += glob.glob(os.path.join(d, 'trae-%s*.json' % uid))
-    if not files:
-        return
-    fp = files[0]
-    try:
-        with open(fp, 'r', encoding='utf-8') as fh:
-            d = json.load(fh)
-        node = d['auth'] if 'auth' in d else d
-        node['accessToken'] = acc['accessToken']
-        node['refreshToken'] = acc.get('refreshToken', '')
-        with open(fp, 'w', encoding='utf-8') as fh:
-            json.dump(d, fh, ensure_ascii=False, indent=2)
-        print('💾 [持久化] 已更新 %s' % os.path.basename(fp))
-    except Exception as e:
-        print('⚠️ [持久化] 写回失败: %s' % e)
 
+# 续期后的 access/refresh Token 只保存在 secure_store 中，不回写普通账号 JSON。
 
 # ══════════════════ 设备号 ══════════════════
 def stable_device_id(seed):
@@ -559,19 +555,6 @@ def save_device_ids(ids):
     except Exception as e:
         print('⚠️  [设备号] 持久化失败: %s' % e)
 
-
-def rotate_device_id(acc):
-    """9074 反复出现时换一个全新设备号：旧号会被服务端记住（越戳越黑），
-    实测换个新号立刻就能签成。新号按时间生成，保证与旧号不同并写回设备号文件。"""
-    key = _acct_key(acc)
-    ids = load_device_ids()
-    new_id = stable_device_id('%s:rotate:%d' % (key, int(time.time())))
-    ids[key] = new_id
-    save_device_ids(ids)
-    acc['deviceId'] = new_id
-    print('🔄 [设备号] %s 换新设备号 %s（旧号已被服务端记住）'
-          % (acc.get('_name') or acc.get('name') or key, new_id))
-    return new_id
 
 
 def device_id_for(acc, manual=''):
@@ -620,7 +603,7 @@ def pick_batch(pending):
     TRAE_BATCH=all 一轮全签（靠账号间错峰 + 熔断兜底），TRAE_BATCH=2 一轮签 2 个。"""
     raw = os.getenv('TRAE_BATCH', '').strip().lower()
     if raw in ('all', '0', ''):
-        return pending          # 默认一轮全签，9074 自动换号兜底
+        return pending          # 默认一轮全签，9074 记冷却后交给下一轮
     if pending and in_peak_hour():
         return pending        # 早窗容量最松，一轮把剩下的全签掉（账号间照常错峰）
     try:
@@ -759,23 +742,30 @@ def status_of(token, device_id):
     try:
         d = json.loads(text)
     except Exception:
-        return None, None, None, -1, text
+        code = status if status in (401, 403) else (RATE_CODE if status in RATE_HTTP_CODES else -1)
+        return None, None, None, code, text
     code = d.get('code', -1)
+    if status in (401, 403):
+        code = status
+    elif status in RATE_HTTP_CODES:
+        code = RATE_CODE
     if status >= 400:
         return None, None, None, code, text
     return (bool(d.get('checked_in', False)), d.get('credits', 0), d.get('enable', False), code, text)
 
 
 def claim(token, device_id):
-    """签到领取积分一次，以业务 code 为准：0 成功 / 9095 今日已签 / 9074 限流可重试。
+    """每轮只发送一次领取请求；限流/5xx 归一化为待重试，不在本轮重发。
     返回 (http, code, message, 本次积分)。"""
     status, text = _post(EP_CLAIM, ug_headers(token, device_id), REQ_BODY)
     try:
         body = json.loads(text)
     except Exception:
-        return status, '?', text, None
+        code = status if status in (401, 403) else (RATE_CODE if status in RATE_HTTP_CODES else '?')
+        return status, code, text, None
     points = ((body.get('data') or {}).get('points')) if isinstance(body.get('data'), dict) else None
-    return status, body.get('code', -1), body.get('message') or text[:120], points
+    code = status if status in (401, 403) else (RATE_CODE if status in RATE_HTTP_CODES else body.get('code', -1))
+    return status, code, body.get('message') or text[:120], points
 
 
 def is_rate(code, status):
@@ -783,36 +773,27 @@ def is_rate(code, status):
 
 
 def claim_with_retry(acc, cache):
-    """每账号每轮只发 1 次 claim（CLAIM_TRIES 可调大，但一般没必要）。
-    9074 属服务端排队限流，短时间内反复轰会被延长惩罚，失败即收工交给下轮 cron；
-    code=1001 时先续期 token 再立即重试（不占退避）。返回 (ok, code, msg, 本次积分)。"""
-    try:
-        tries = max(1, int(os.getenv('CLAIM_TRIES', '1')))
-    except Exception:
-        tries = 1
-    last = ('?', '')
-    for attempt in range(1, tries + 1):
+    """每轮最多一次领取 POST；仅明确的鉴权拒绝允许续期后再发一次。
+    429/9074/5xx 与网络失败均不重复领取，交给账号冷却和后续计划任务。"""
+    status, code, msg, points = claim(acc['accessToken'], acc.get('deviceId'))
+    if code == 0:
+        return True, code, msg, points
+    if code == ALREADY_CODE:
+        return False, code, msg, None
+    if code in AUTH_FAIL_CODES and acc.get('refreshToken'):
+        print('🔑 [claim] 检测到 code=%s，尝试刷新 token ...' % code)
+        ok, rmsg = ensure_token(acc, cache)
+        if not ok:
+            return False, code, rmsg, None
         status, code, msg, points = claim(acc['accessToken'], acc.get('deviceId'))
-        last = (code, msg)
         if code == 0:
             return True, code, msg, points
         if code == ALREADY_CODE:
             return False, code, msg, None
-        if code in AUTH_FAIL_CODES and acc.get('refreshToken'):
-            print('🔑 [claim] 检测到 code=%s，尝试刷新 token ...' % code)
-            ok, rmsg = ensure_token(acc, cache)
-            if not ok:
-                return False, code, rmsg, None
-            continue
-        if not is_rate(code, status):
-            return False, code, msg
-        if attempt < tries:
-            wait = random.randint(4, 9)
-            print('⏳ [限流] 第%d次被限，%ds 后重试（或交给下轮 cron）...' % (attempt, wait))
-            time.sleep(wait)
-            continue
-        print('⏳ [限流] 本轮放弃，等下轮 cron 自动补签')
-    return False, last[0], last[1], None
+    if is_rate(code, status):
+        print('⏳ [限流] 本轮不重复领取，进入账号冷却并交给下轮计划任务')
+        return False, RATE_CODE, msg, None
+    return False, code, msg, None
 
 
 def credits_summary(acc):
@@ -903,8 +884,18 @@ def checkin_account(acc, cache):
     if not acc.get('accessToken'):
         ok, msg = ensure_token(acc, cache) if acc.get('refreshToken') else (False, '解密后无 token')
         if not ok:
-            result['status'] = 'token失效' if acc.get('refreshToken') else '无token'
-            result['detail'] = msg
+            if acc.get('refreshToken') and _refresh_was_rejected(msg):
+                result['status'] = '鉴权失败'
+                result['icon'] = '🔑'
+                result['detail'] = 'refreshToken 被明确拒绝；重新登录后执行 python run_all.py --unfreeze trae'
+                freeze_account('trae', acc.get('uid') or _acct_key(acc), 'AUTH_REJECTED')
+            elif acc.get('refreshToken'):
+                result['status'] = '待重试'
+                result['icon'] = '⏳'
+                result['detail'] = 'Token 续期服务暂时不可用；未冻结账号，等待后续计划任务'
+            else:
+                result['status'] = '无token'
+                result['detail'] = msg
             return result
 
     acc['deviceId'] = device_id_for(acc, acc.get('deviceId', ''))
@@ -912,14 +903,17 @@ def checkin_account(acc, cache):
     log_head('📡 %s 签到状态查询' % name)
 
     checked_in, credits, enable, code, raw = status_of(acc['accessToken'], acc['deviceId'])
+    auth_rejected = code in AUTH_FAIL_CODES and not acc.get('refreshToken')
     if code in AUTH_FAIL_CODES and acc.get('refreshToken'):
         print('🔑 [刷新] 检测到 code=%s 鉴权失败，尝试刷新 token ...' % code)
         ok, msg = ensure_token(acc, cache)
         if ok:
             print('✅ [刷新] token 已更新')
             checked_in, credits, enable, code, raw = status_of(acc['accessToken'], acc['deviceId'])
+            auth_rejected = code in AUTH_FAIL_CODES
         else:
-            print('❌ [刷新] 失败: %s' % msg)
+            print('❌ [刷新] 失败（本轮不冻结，需区分网络故障与凭据拒绝）')
+            auth_rejected = _refresh_was_rejected(msg)
     print('📊 [状态] 今日已签: %s   积分: %s   开放: %s' % (checked_in, credits, enable))
 
     if checked_in:
@@ -931,12 +925,24 @@ def checkin_account(acc, cache):
             else '今日已签，积分 %s' % credits
         print('☑️  [结果] 今日已签到')
         return result
-    # 状态查询拿到鉴权失败（刷新后仍 1001）→ 硬失败，绝不浪费 claim 请求
+    # 状态查询拿到鉴权失败（刷新后仍被拒）→ 账号冻结，避免每小时反复撞失效凭据。
     if code in AUTH_FAIL_CODES:
-        result['icon'] = '🔑'
-        result['status'] = '鉴权失败'
-        result['detail'] = 'token 无效且自动续期失败，需重新登录取新 refreshToken'
-        print('❌ [结果] 鉴权失败（硬失败）')
+        if auth_rejected:
+            result['icon'] = '🔑'
+            result['status'] = '鉴权失败'
+            result['detail'] = '账号凭据被明确拒绝；请重新登录后执行 python run_all.py --unfreeze trae'
+            freeze_account('trae', acc.get('uid') or _acct_key(acc), 'AUTH_REJECTED')
+            print('❌ [结果] 鉴权失败，已冻结该账号（需重新登录并手动解冻）')
+        else:
+            result['icon'] = '⏳'
+            result['status'] = '待重试'
+            result['detail'] = '刷新服务暂时不可用，本轮不冻结账号；等待后续计划任务'
+        return result
+    if code == RATE_CODE:
+        set_cooldown(_acct_key(acc), cooldown_minutes())
+        result['icon'] = '⏳'
+        result['status'] = '待重试'
+        result['detail'] = '签到状态查询被限流/服务端繁忙，本轮不发 claim，账号进入冷却'
         return result
     # 状态查询本身不通（HTTP 异常 / 非 JSON）→ 先不发 claim，等下一轮
     if checked_in is None:
@@ -958,15 +964,11 @@ def checkin_account(acc, cache):
 
     result['_claimed'] = True          # 只有真正发过 claim 才需要账号间错峰
     ok, code, msg, gained = claim_with_retry(acc, cache)
-    if code == RATE_CODE and os.getenv('TRAE_ROTATE', '1').strip() != '0':
-        # 9074 不是限流，是这个设备号被服务端记住了 —— 换个新号立刻能签（实测）
-        rotate_device_id(acc)
-        ok, code, msg, gained = claim_with_retry(acc, cache)
-    if code == RATE_CODE:
-        set_cooldown(_acct_key(acc), cooldown_minutes())
     if ok:
         pts = credits_summary(acc)
         result['status'] = '签到成功'
+        if gained is not None:
+            result['reward_amount'] = gained
         gain = ('，本次 +%s 积分' % _fmt(gained)) if gained else ''
         if pts is not None:
             result['credits'] = pts
@@ -982,10 +984,21 @@ def checkin_account(acc, cache):
         result['credits'] = credits
         result['detail'] = '今日已签到(9095)'
         print('☑️  [结果] 今日已签到')
+    elif code in AUTH_FAIL_CODES:
+        result['icon'] = '🔑'
+        if not acc.get('refreshToken') or _refresh_was_rejected(msg):
+            result['status'] = '鉴权失败'
+            result['detail'] = 'claim/refresh 明确拒绝鉴权；重新登录后执行 python run_all.py --unfreeze trae'
+            freeze_account('trae', acc.get('uid') or _acct_key(acc), 'AUTH_REJECTED')
+            print('❌ [结果] claim 鉴权失败，已冻结该账号')
+        else:
+            result['status'] = '待重试'
+            result['detail'] = 'refresh 服务暂时不可用，本轮不冻结账号；等待后续计划任务'
     elif code == RATE_CODE:
+        set_cooldown(_acct_key(acc), cooldown_minutes())
         result['icon'] = '⏳'
         result['status'] = '待重试'
-        result['detail'] = '参与用户太多(9074)，本轮未签成，下轮 cron 自动补签'
+        result['detail'] = '限流/服务端繁忙，本轮不再重复领取，账号进入冷却'
         print('⏳ [结果] %s' % result['detail'])
     else:
         result['icon'] = '❌'
@@ -1002,6 +1015,29 @@ def _fmt(v):
         return str(v)
 
 
+STATUS_SUCCESS = "\u7b7e\u5230\u6210\u529f"
+STATUS_ALREADY = "\u5df2\u7b7e\u5230"
+
+
+def record_confirmed_claim(account, result, evidence_override=None):
+    status = result.get("status") if isinstance(result, dict) else None
+    if status not in (STATUS_SUCCESS, STATUS_ALREADY):
+        return False
+    amount = result.get("reward_amount")
+    rule_id = (
+        "trae-cn-daily-member" if amount == 200 else
+        "trae-cn-daily-free" if amount == 150 else
+        "trae-cn-daily-unknown-tier"
+    )
+    evidence = evidence_override or ("state_reverified" if status == STATUS_ALREADY else "explicit_success")
+    return append_claim(
+        "trae-cn", account.get("uid") or _acct_key(account), rule_id,
+        time.strftime("%Y-%m-%d", time.gmtime(time.time() + 8 * 3600)),
+        amount=amount, evidence=evidence,
+        outcome="already" if status == STATUS_ALREADY else "claimed"
+    )
+
+
 def summarize_results(results):
     """汇总结果并给出进程退出码契约（run_all.py 依赖它做失败分类）。
 
@@ -1012,12 +1048,12 @@ def summarize_results(results):
     "未开放"（enable=false）是服务端临时状态：不记 done、退出非 0（run_all 判 RETRY），
     下轮计划任务在其开放后继续签——避免"临时未开放"被误记为当天完成而封死重试（假绿）。
     """
-    ok_n = sum(1 for r in results if r['status'] == '签到成功')
-    already_n = sum(1 for r in results if r['status'] == '已签到')
+    ok_n = sum(1 for r in results if r['status'] == STATUS_SUCCESS and not r.get("ledger_warning"))
+    already_n = sum(1 for r in results if r['status'] == STATUS_ALREADY and not r.get("ledger_warning"))
     soft_n = sum(1 for r in results if r['status'] in SOFT)
     dead_n = sum(1 for r in results if r['status'] in DEAD)
     fail_n = len(results) - ok_n - already_n - soft_n - dead_n
-    needs_human = sum(1 for r in results if r['status'] == '鉴权失败')
+    needs_human = sum(1 for r in results if r['status'] in ('鉴权失败', '已冻结'))
     return {'ok': ok_n, 'already': already_n, 'soft': soft_n,
             'dead': dead_n, 'fail': fail_n,
             'exit': 1 if (fail_n + needs_human) else 0}
@@ -1025,7 +1061,7 @@ def summarize_results(results):
 
 # ══════════════════ 主流程 ══════════════════
 SOFT = ('待重试',)               # 限流类，冷却到点由 cron 补签，不算失败
-DEAD = ('鉴权失败',)             # 需要人工处理（硬失败）；未开放(enable=false)归可重试
+DEAD = ('鉴权失败', '已冻结')   # 明确认证拒绝后冻结，需人工登录并显式解冻
 COOLDOWN_MIN = 55                # 平时 9074 冷却分钟数（实测 8 小时后仍未解除，一小时一试）
 PEAK_COOLDOWN_MIN = 12           # 早窗内的短冷却，好让下一轮还在窗口里补签
 GAP_MIN, GAP_MAX = 12, 25        # 实测 25s 间隔可让相邻账号连续签到成功
@@ -1054,13 +1090,24 @@ def main():
     state = load_state()
     for acc in accounts:
         key = _acct_key(acc)
+        if is_frozen('trae', acc.get('uid') or key):
+            results.append({
+                'name': acc.get('_name') or acc.get('name') or key,
+                'uid': acc.get('uid', '-'), 'icon': '🔒', 'status': '已冻结',
+                'credits': '-', 'detail': '认证拒绝后已暂停；重新登录后执行 python run_all.py --unfreeze trae'
+            })
+            continue
         rec = (state.get('done') or {}).get(key)
         if rec:
-            results.append({'name': acc.get('_name') or acc.get('name') or key,
-                            'uid': acc.get('uid', '-'), 'icon': '☑️', 'status': '已签到',
-                            'credits': rec.get('credits', '-'),
-                            'detail': '今日已完成（%s），跳过请求' % rec.get('at', '-')})
-            print('☑️  [%s] 今日已签到，跳过' % (acc.get('_name') or acc.get('name') or key))
+            cached_result = {'name': acc.get('_name') or acc.get('name') or key,
+                             'uid': acc.get('uid', '-'), 'icon': '\u2611\ufe0f', 'status': STATUS_ALREADY,
+                             'credits': rec.get('credits', '-'), 'detail': 'cached successful state'}
+            try:
+                record_confirmed_claim(acc, cached_result, evidence_override="local_state")
+            except Exception as exc:
+                cached_result['ledger_warning'] = 'ledger write failed (%s)' % type(exc).__name__
+            results.append(cached_result)
+            print('\u2611\ufe0f  [%s] \u4eca\u65e5\u5df2\u7b7e\u5230\uff0c\u8df3\u8fc7' % (acc.get('_name') or acc.get('name') or key))
         else:
             left = cooldown_left(key)
             if left > 0:
@@ -1069,7 +1116,9 @@ def main():
             else:
                 pending.append(acc)
     if not pending:
-        if any(cooldown_left(_acct_key(a)) > 0 for a in accounts):
+        if any(is_frozen('trae', a.get('uid') or _acct_key(a)) for a in accounts):
+            print('🔒 无待运行账号：至少一个账号处于人工冻结状态')
+        elif any(cooldown_left(_acct_key(a)) > 0 for a in accounts):
             print('⏳ 全部待签账号都在冷却中，等冷却到点由 cron 补签')
         else:
             print('✅ 全部账号今日均已完成，无需请求接口')
@@ -1093,6 +1142,14 @@ def main():
             time.sleep(gap)
         try:
             r = checkin_account(acc, cache)
+            ledger_recorded = True
+            if r.get('status') in (STATUS_SUCCESS, STATUS_ALREADY):
+                try:
+                    record_confirmed_claim(acc, r)
+                except Exception as exc:
+                    ledger_recorded = False
+                    r['ledger_warning'] = 'ledger write failed (%s)' % type(exc).__name__
+                    r['detail'] = (r.get('detail') or '') + '; confirmed result will be rechecked for ledger retry'
             if r['status'] == '待重试':
                 # 实测 9074 是按账号/时间片的容量门，与出口 IP 无关，
                 # 所以不再"连坐"：失败的记冷却，后面的账号继续签。
@@ -1105,7 +1162,7 @@ def main():
                     break
                 prev_claimed = True     # 刚发过 claim，下一个账号照常错峰
                 continue
-            if r['status'] in ('签到成功', '已签到'):
+            if r['status'] in (STATUS_SUCCESS, STATUS_ALREADY) and ledger_recorded:
                 mark_done(_acct_key(acc), {'status': r['status'], 'credits': r.get('credits'),
                                            'at': bj()})
             prev_claimed = bool(r.get('_claimed'))

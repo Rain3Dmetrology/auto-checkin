@@ -35,7 +35,10 @@ import sys
 import time
 import urllib.request
 
+from account_controls import list_frozen, unfreeze_accounts
+
 HERE = os.path.dirname(os.path.abspath(__file__))
+TRAE_SIGNIN_PAUSE_FILE = os.path.join(HERE, "trae", ".signin-paused")
 LOG_DIR = os.path.join(HERE, "logs")
 HEALTH_FILE = os.path.join(LOG_DIR, "health.json")
 PYTHON = sys.executable or "pythonw.exe"
@@ -324,6 +327,7 @@ def run_child(name, script, args, env_extra=None, cwd=None):
 OUTCOME_OK = "OK"
 OUTCOME_RETRY = "RETRY"
 OUTCOME_HUMAN = "NEEDS_HUMAN"
+OUTCOME_PAUSED = "PAUSED"
 
 
 def classify_outcome(name, code, output):
@@ -340,7 +344,7 @@ def classify_outcome(name, code, output):
     out = output or ""
 
     if name == "workbuddy":
-        if any(reason in out for reason in ("NO_SESSION", "AUTH_ERROR", "AUTH_REJECTED", "FORBIDDEN")):
+        if any(reason in out for reason in ("NO_SESSION", "AUTH_ERROR", "AUTH_REJECTED", "FORBIDDEN", "FROZEN")):
             return OUTCOME_HUMAN
         if "NETWORK" in out or "TIMEOUT" in out:
             return OUTCOME_RETRY
@@ -349,7 +353,7 @@ def classify_outcome(name, code, output):
         return OUTCOME_RETRY
 
     if name == "trae":
-        if "鉴权失败" in out:
+        if "鉴权失败" in out or "已冻结" in out:
             return OUTCOME_HUMAN
         return OUTCOME_RETRY
 
@@ -371,7 +375,16 @@ def update_health(state, name, outcome, error=""):
     """更新单个任务的运行健康记录：连续失败计数 + 最近成功/失败时间。"""
     rec = state.setdefault(name, {})
     rec["outcome"] = outcome
-    if outcome == OUTCOME_OK:
+    if outcome != OUTCOME_PAUSED:
+        rec.pop("paused", None)
+        rec.pop("pause_reason", None)
+        rec.pop("paused_at", None)
+    if outcome == OUTCOME_PAUSED:
+        rec["paused"] = True
+        rec["paused_at"] = _now()
+        if error:
+            rec["pause_reason"] = str(error)[:200]
+    elif outcome == OUTCOME_OK:
         rec["consecutive_failures"] = 0
         rec["last_success"] = _now()
         rec.pop("last_error", None)    # 成功即清残留错误，避免误导排查
@@ -471,6 +484,13 @@ def task_trae(poll=None):
     if not os.path.isfile(script):
         log("trae 跳过：trae_checkin.py 不存在")
         return 0, None
+    if os.path.isfile(TRAE_SIGNIN_PAUSE_FILE):
+        reason = "轮换凭据恢复前暂停 TRAE 上游请求；确认客户端重新登录并验证 DPAPI 缓存后再移除暂停标记"
+        log("trae 状态=PAUSED：" + reason)
+        health = load_health()
+        update_health(health, "trae", OUTCOME_PAUSED, reason)
+        save_health(health)
+        return 0, "PAUSED"
     try:
         cred = load_trae_credential()
     except Exception as exc:
@@ -489,6 +509,11 @@ def task_trae(poll=None):
     # the cache with the new token pair.
     storage_path = cred.get("path")
     cache_path = os.environ.get("TRAE_TOKEN_CACHE", "").strip()
+    if not cache_path and os.name == "nt":
+        cache_path = os.path.join(
+            os.environ.get("LOCALAPPDATA") or os.path.join(
+                os.path.expanduser("~"), "AppData", "Local"),
+            "AutoCheckin", "credentials", "trae-token-cache.dpapi")
     if not cache_path:
         for candidate in (os.path.join("/ql/data/config", ".trae_token_cache.json"),
                           os.path.join(HERE, "trae", ".trae_token_cache.json")):
@@ -573,6 +598,31 @@ def release_runner_lock(handle):
 
 def main():
     argv = sys.argv[1:]
+    if "--list-frozen" in argv:
+        records = list_frozen()
+        if not records:
+            print("没有被冻结的账号。")
+        else:
+            for record in records:
+                frozen_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(record.get("frozen_at") or 0))
+                print("{provider} {id} {reason} {at}".format(
+                    provider=record["provider"], id=record["id"],
+                    reason=record["reason"], at=frozen_at))
+        return
+    if "--unfreeze" in argv:
+        index = argv.index("--unfreeze")
+        if index + 1 >= len(argv):
+            raise SystemExit("Usage: python run_all.py --unfreeze workbuddy|trae|qoder [account-id] or --unfreeze all")
+        provider = argv[index + 1].lower()
+        account_id = argv[index + 2] if index + 2 < len(argv) and not argv[index + 2].startswith("--") else None
+        if provider == "all" and account_id:
+            raise SystemExit("Use a provider name when unfreezing one account; --unfreeze all takes no account-id")
+        try:
+            removed = unfreeze_accounts(provider, account_id)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from None
+        print("已解除 {0} 个冻结账号。".format(len(removed)))
+        return
     poll = "--poll" in argv or "--boot" in argv
     only = None
     for i, a in enumerate(argv):
@@ -589,9 +639,12 @@ def main():
 
     names = [only] if only in TASKS else ["workbuddy", "trae", "qoder"]
     failed = []
+    paused = []
     for n in names:
         try:
-            rc, _ = TASKS[n](poll)
+            rc, detail = TASKS[n](poll)
+            if n == "trae" and detail == "PAUSED":
+                paused.append(n)
         except Exception as exc:
             # 调度层兜底：任何任务的意外异常只算它自己失败，绝不波及后续任务
             log("%s 调度异常: %s" % (n, exc))
@@ -603,7 +656,10 @@ def main():
         log("本轮结果：失败 %s" % "、".join(failed))
         log("=" * 60)
         sys.exit(1)
-    log("本轮结果：全部成功（已签/跳过视为成功）")
+    if paused:
+        log("本轮结果：活动任务已完成；暂停任务：%s" % "、".join(paused))
+    else:
+        log("本轮结果：全部成功（已签/跳过视为成功）")
     log("=" * 60)
     sys.exit(0)
 
